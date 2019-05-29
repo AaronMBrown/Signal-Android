@@ -1,109 +1,102 @@
 package org.thoughtcrime.securesms.jobs;
 
-import android.content.Context;
-import android.util.Log;
+import android.support.annotation.NonNull;
+import android.support.annotation.Nullable;
 
 import org.thoughtcrime.securesms.BuildConfig;
 import org.thoughtcrime.securesms.TextSecureExpiredException;
-import org.thoughtcrime.securesms.crypto.MasterSecret;
+import org.thoughtcrime.securesms.attachments.Attachment;
+import org.thoughtcrime.securesms.database.AttachmentDatabase;
 import org.thoughtcrime.securesms.database.DatabaseFactory;
-import org.thoughtcrime.securesms.database.PartDatabase;
+import org.thoughtcrime.securesms.jobmanager.Job;
+import org.thoughtcrime.securesms.jobmanager.JobLogger;
+import org.thoughtcrime.securesms.logging.Log;
 import org.thoughtcrime.securesms.mms.MediaConstraints;
+import org.thoughtcrime.securesms.mms.MediaStream;
+import org.thoughtcrime.securesms.mms.MmsException;
 import org.thoughtcrime.securesms.transport.UndeliverableMessageException;
 import org.thoughtcrime.securesms.util.MediaUtil;
 import org.thoughtcrime.securesms.util.Util;
-import org.whispersystems.jobqueue.JobParameters;
 
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.util.LinkedList;
+import java.util.List;
 
-import ws.com.google.android.mms.MmsException;
-import ws.com.google.android.mms.pdu.PduBody;
-import ws.com.google.android.mms.pdu.PduPart;
-import ws.com.google.android.mms.pdu.SendReq;
+public abstract class SendJob extends BaseJob {
 
-public abstract class SendJob extends MasterSecretJob {
+  @SuppressWarnings("unused")
   private final static String TAG = SendJob.class.getSimpleName();
 
-  public SendJob(Context context, JobParameters parameters) {
-    super(context, parameters);
+  public SendJob(Job.Parameters parameters) {
+    super(parameters);
   }
 
   @Override
-  public final void onRun(MasterSecret masterSecret) throws Exception {
-    if (!Util.isBuildFresh()) {
+  public final void onRun() throws Exception {
+    if (Util.getDaysTillBuildExpiry() <= 0) {
       throw new TextSecureExpiredException(String.format("TextSecure expired (build %d, now %d)",
                                                          BuildConfig.BUILD_TIMESTAMP,
                                                          System.currentTimeMillis()));
     }
 
-    onSend(masterSecret);
+    Log.i(TAG, "Starting message send attempt");
+    onSend();
+    Log.i(TAG, "Message send completed");
   }
 
-  protected abstract void onSend(MasterSecret masterSecret) throws Exception;
+  protected abstract void onSend() throws Exception;
 
-  protected SendReq getResolvedMessage(MasterSecret masterSecret, SendReq message,
-                                       MediaConstraints constraints, boolean toMemory)
-      throws IOException, UndeliverableMessageException
+  protected void markAttachmentsUploaded(long messageId, @NonNull List<Attachment> attachments) {
+    AttachmentDatabase database = DatabaseFactory.getAttachmentDatabase(context);
+
+    for (Attachment attachment : attachments) {
+      database.markAttachmentUploaded(messageId, attachment);
+    }
+  }
+
+  protected List<Attachment> scaleAndStripExifFromAttachments(@NonNull MediaConstraints constraints,
+                                                              @NonNull List<Attachment> attachments)
+      throws UndeliverableMessageException
   {
-    PduBody body = new PduBody();
-    try {
-      for (int i = 0; i < message.getBody().getPartsNum(); i++) {
-        body.addPart(getResolvedPart(masterSecret, constraints, message.getBody().getPart(i), toMemory));
+    AttachmentDatabase attachmentDatabase = DatabaseFactory.getAttachmentDatabase(context);
+    List<Attachment>   results            = new LinkedList<>();
+
+    for (Attachment attachment : attachments) {
+      try {
+        if (constraints.isSatisfied(context, attachment)) {
+          if (MediaUtil.isJpeg(attachment)) {
+            MediaStream stripped = constraints.getResizedMedia(context, attachment);
+            results.add(attachmentDatabase.updateAttachmentData(attachment, stripped));
+          } else {
+            results.add(attachment);
+          }
+        } else if (constraints.canResize(attachment)) {
+          MediaStream resized = constraints.getResizedMedia(context, attachment);
+          results.add(attachmentDatabase.updateAttachmentData(attachment, resized));
+        } else {
+          throw new UndeliverableMessageException("Size constraints could not be met!");
+        }
+      } catch (IOException | MmsException e) {
+        throw new UndeliverableMessageException(e);
       }
-    } catch (MmsException me) {
-      throw new UndeliverableMessageException(me);
     }
-    return new SendReq(message.getPduHeaders(),
-                       body,
-                       message.getDatabaseMessageId(),
-                       message.getDatabaseMessageBox(),
-                       message.getSentTimestamp());
+
+    return results;
   }
 
-  private PduPart getResolvedPart(MasterSecret masterSecret, MediaConstraints constraints,
-                                  PduPart part, boolean toMemory)
-      throws IOException, MmsException, UndeliverableMessageException
-  {
-    byte[] resizedData = null;
-
-    if (!constraints.isSatisfied(context, masterSecret, part)) {
-      if (!constraints.canResize(part)) {
-        throw new UndeliverableMessageException("Size constraints could not be satisfied.");
-      }
-      resizedData = getResizedPartData(masterSecret, constraints, part);
-    }
-
-    if (toMemory && part.getDataUri() != null) {
-      part.setData(resizedData != null ? resizedData : MediaUtil.getPartData(context, masterSecret, part));
-    }
-
-    if (resizedData != null) {
-      part.setDataSize(resizedData.length);
-    }
-    return part;
+  protected void log(@NonNull String tag, @NonNull String message) {
+    Log.i(tag, JobLogger.format(this, message));
   }
 
-  protected void markPartsUploaded(long messageId, PduBody body) {
-    if (body == null) return;
-    PartDatabase database = DatabaseFactory.getPartDatabase(context);
-    for (int i = 0; i < body.getPartsNum(); i++) {
-      database.markPartUploaded(messageId, body.getPart(i));
-    }
+  protected void warn(@NonNull String tag, @NonNull String message) {
+    warn(tag, message, null);
   }
 
-  private byte[] getResizedPartData(MasterSecret masterSecret, MediaConstraints constraints,
-                                    PduPart part)
-      throws IOException, MmsException
-  {
-    Log.w(TAG, "resizing part " + part.getPartId());
+  protected void warn(@NonNull String tag, @Nullable Throwable t) {
+    warn(tag, "", t);
+  }
 
-    final long   oldSize = part.getDataSize();
-    final byte[] data    = constraints.getResizedMedia(context, masterSecret, part);
-
-    DatabaseFactory.getPartDatabase(context).updatePartData(masterSecret, part, new ByteArrayInputStream(data));
-    Log.w(TAG, String.format("Resized part %.1fkb => %.1fkb", oldSize / 1024.0, part.getDataSize() / 1024.0));
-
-    return data;
+  protected void warn(@NonNull String tag, @NonNull String message, @Nullable Throwable t) {
+    Log.w(tag, JobLogger.format(this, message), t);
   }
 }

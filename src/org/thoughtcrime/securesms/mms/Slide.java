@@ -23,32 +23,62 @@ import android.support.annotation.DrawableRes;
 import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
 
-import org.thoughtcrime.securesms.crypto.MasterSecret;
+import org.thoughtcrime.securesms.attachments.Attachment;
+import org.thoughtcrime.securesms.attachments.UriAttachment;
+import org.thoughtcrime.securesms.database.AttachmentDatabase;
 import org.thoughtcrime.securesms.util.MediaUtil;
-import org.thoughtcrime.securesms.database.PartDatabase;
 import org.thoughtcrime.securesms.util.Util;
+import org.whispersystems.libsignal.util.guava.Optional;
 
-import java.io.IOException;
-import java.io.InputStream;
-
-import ws.com.google.android.mms.pdu.PduPart;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
 
 public abstract class Slide {
 
-  protected final PduPart part;
-  protected final Context context;
+  protected final Attachment attachment;
+  protected final Context    context;
 
-  public Slide(Context context, @NonNull PduPart part) {
-    this.part    = part;
-    this.context = context;
+  public Slide(@NonNull Context context, @NonNull Attachment attachment) {
+    this.context    = context;
+    this.attachment = attachment;
   }
 
   public String getContentType() {
-    return new String(part.getContentType());
+    return attachment.getContentType();
   }
 
+  @Nullable
   public Uri getUri() {
-    return part.getDataUri();
+    return attachment.getDataUri();
+  }
+
+  @Nullable
+  public Uri getThumbnailUri() {
+    return attachment.getThumbnailUri();
+  }
+
+  @NonNull
+  public Optional<String> getBody() {
+    return Optional.absent();
+  }
+
+  @NonNull
+  public Optional<String> getCaption() {
+    return Optional.fromNullable(attachment.getCaption());
+  }
+
+  @NonNull
+  public Optional<String> getFileName() {
+    return Optional.fromNullable(attachment.getFileName());
+  }
+
+  @Nullable
+  public String getFastPreflightId() {
+    return attachment.getFastPreflightId();
+  }
+
+  public long getFileSize() {
+    return attachment.getSize();
   }
 
   public boolean hasImage() {
@@ -63,59 +93,76 @@ public abstract class Slide {
     return false;
   }
 
-  public @NonNull String getContentDescription() { return ""; }
-
-  public PduPart getPart() {
-    return part;
+  public boolean hasDocument() {
+    return false;
   }
 
-  public Uri getThumbnailUri() {
-    return null;
+  public boolean hasLocation() {
+    return false;
+  }
+
+  public @NonNull String getContentDescription() { return ""; }
+
+  public Attachment asAttachment() {
+    return attachment;
   }
 
   public boolean isInProgress() {
-    return part.isInProgress();
+    return attachment.isInProgress();
   }
 
   public boolean isPendingDownload() {
-    return getTransferProgress() == PartDatabase.TRANSFER_PROGRESS_FAILED ||
-           getTransferProgress() == PartDatabase.TRANSFER_PROGRESS_AUTO_PENDING;
+    return getTransferState() == AttachmentDatabase.TRANSFER_PROGRESS_FAILED ||
+           getTransferState() == AttachmentDatabase.TRANSFER_PROGRESS_PENDING;
   }
 
-  public long getTransferProgress() {
-    return part.getTransferProgress();
+  public int getTransferState() {
+    return attachment.getTransferState();
   }
 
   public @DrawableRes int getPlaceholderRes(Theme theme) {
     throw new AssertionError("getPlaceholderRes() called for non-drawable slide");
   }
 
-  public boolean isDraft() {
-    return !getPart().getPartId().isValid();
+  public boolean hasPlaceholder() {
+    return false;
   }
 
+  public boolean hasPlayOverlay() {
+    return false;
+  }
 
-  protected static PduPart constructPartFromUri(@NonNull  Context      context,
-                                                @NonNull  Uri          uri,
-                                                @NonNull  String       defaultMime,
-                                                          long         dataSize)
-      throws IOException
+  protected static Attachment constructAttachmentFromUri(@NonNull  Context context,
+                                                         @NonNull  Uri     uri,
+                                                         @NonNull  String  defaultMime,
+                                                                   long    size,
+                                                                   int     width,
+                                                                   int     height,
+                                                                   boolean hasThumbnail,
+                                                         @Nullable String  fileName,
+                                                         @Nullable String  caption,
+                                                                   boolean voiceNote,
+                                                                   boolean quote)
   {
-    final PduPart part            = new PduPart();
-    final String  mimeType        = MediaUtil.getMimeType(context, uri);
-    final String  derivedMimeType = mimeType != null ? mimeType : defaultMime;
-
-    part.setDataSize(dataSize);
-    part.setDataUri(uri);
-    part.setContentType(derivedMimeType.getBytes());
-    part.setContentId((System.currentTimeMillis()+"").getBytes());
-    part.setName((MediaUtil.getDiscreteMimeType(derivedMimeType) + System.currentTimeMillis()).getBytes());
-
-    return part;
+    String                 resolvedType    = Optional.fromNullable(MediaUtil.getMimeType(context, uri)).or(defaultMime);
+    String                 fastPreflightId = String.valueOf(new SecureRandom().nextLong());
+    return new UriAttachment(uri,
+                             hasThumbnail ? uri : null,
+                             resolvedType,
+                             AttachmentDatabase.TRANSFER_PROGRESS_STARTED,
+                             size,
+                             width,
+                             height,
+                             fileName,
+                             fastPreflightId,
+                             voiceNote,
+                             quote,
+                             caption);
   }
 
   @Override
   public boolean equals(Object other) {
+    if (other == null)             return false;
     if (!(other instanceof Slide)) return false;
 
     Slide that = (Slide)other;
@@ -124,8 +171,7 @@ public abstract class Slide {
            this.hasAudio() == that.hasAudio()                        &&
            this.hasImage() == that.hasImage()                        &&
            this.hasVideo() == that.hasVideo()                        &&
-           this.isDraft() == that.isDraft()                          &&
-           this.getTransferProgress() == that.getTransferProgress()  &&
+           this.getTransferState() == that.getTransferState()        &&
            Util.equals(this.getUri(), that.getUri())                 &&
            Util.equals(this.getThumbnailUri(), that.getThumbnailUri());
   }
@@ -133,6 +179,6 @@ public abstract class Slide {
   @Override
   public int hashCode() {
     return Util.hashCode(getContentType(), hasAudio(), hasImage(),
-                         hasVideo(), isDraft(), getUri(), getThumbnailUri(), getTransferProgress());
+                         hasVideo(), getUri(), getThumbnailUri(), getTransferState());
   }
 }

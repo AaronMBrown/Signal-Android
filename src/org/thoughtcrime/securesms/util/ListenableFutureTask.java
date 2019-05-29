@@ -16,27 +16,53 @@
  */
 package org.thoughtcrime.securesms.util;
 
+import android.support.annotation.Nullable;
+
 import java.util.LinkedList;
 import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
 import java.util.concurrent.FutureTask;
 
 public class ListenableFutureTask<V> extends FutureTask<V> {
 
   private final List<FutureTaskListener<V>> listeners = new LinkedList<>();
 
+  @Nullable
+  private final Object identifier;
+
+  @Nullable
+  private final Executor callbackExecutor;
+
   public ListenableFutureTask(Callable<V> callable) {
-    super(callable);
+    this(callable, null);
   }
 
+  public ListenableFutureTask(Callable<V> callable, @Nullable Object identifier) {
+    this(callable, identifier, null);
+  }
+
+  public ListenableFutureTask(Callable<V> callable, @Nullable Object identifier, @Nullable Executor callbackExecutor) {
+    super(callable);
+    this.identifier       = identifier;
+    this.callbackExecutor = callbackExecutor;
+  }
+
+
   public ListenableFutureTask(final V result) {
+    this(result, null);
+  }
+
+  public ListenableFutureTask(final V result, @Nullable Object identifier) {
     super(new Callable<V>() {
       @Override
       public V call() throws Exception {
         return result;
       }
     });
+    this.identifier       = identifier;
+    this.callbackExecutor = null;
     this.run();
   }
 
@@ -58,9 +84,17 @@ public class ListenableFutureTask<V> extends FutureTask<V> {
   }
 
   private void callback() {
-    for (FutureTaskListener<V> listener : listeners) {
-      callback(listener);
-    }
+    Runnable callbackRunnable = new Runnable() {
+      @Override
+      public void run() {
+        for (FutureTaskListener<V> listener : listeners) {
+          callback(listener);
+        }
+      }
+    };
+
+    if (callbackExecutor == null) callbackRunnable.run();
+    else                          callbackExecutor.execute(callbackRunnable);
   }
 
   private void callback(FutureTaskListener<V> listener) {
@@ -73,5 +107,20 @@ public class ListenableFutureTask<V> extends FutureTask<V> {
         listener.onFailure(e);
       }
     }
+  }
+
+  @Override
+  public boolean equals(Object other) {
+    if (other != null && other instanceof ListenableFutureTask && this.identifier != null) {
+      return identifier.equals(other);
+    } else {
+      return super.equals(other);
+    }
+  }
+
+  @Override
+  public int hashCode() {
+    if (identifier != null) return identifier.hashCode();
+    else                    return super.hashCode();
   }
 }

@@ -19,26 +19,19 @@ package org.thoughtcrime.securesms.service;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
-import android.os.Build;
 import android.os.Bundle;
 import android.provider.Telephony;
 import android.telephony.SmsMessage;
-import android.util.Log;
+import org.thoughtcrime.securesms.logging.Log;
 
 import org.thoughtcrime.securesms.ApplicationContext;
 import org.thoughtcrime.securesms.jobs.SmsReceiveJob;
-import org.thoughtcrime.securesms.util.TextSecurePreferences;
 import org.thoughtcrime.securesms.util.Util;
-
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 public class SmsListener extends BroadcastReceiver {
 
   private static final String SMS_RECEIVED_ACTION  = Telephony.Sms.Intents.SMS_RECEIVED_ACTION;
   private static final String SMS_DELIVERED_ACTION = Telephony.Sms.Intents.SMS_DELIVER_ACTION;
-
-  private static final Pattern CHALLENGE_PATTERN = Pattern.compile(".*Your TextSecure verification code: ([0-9]{3,4})-([0-9]{3,4}).*");
 
   private boolean isExemption(SmsMessage message, String messageBody) {
 
@@ -81,16 +74,6 @@ public class SmsListener extends BroadcastReceiver {
     return bodyBuilder.toString();
   }
 
-//  private ArrayList<IncomingTextMessage> getAsTextMessages(Intent intent) {
-//    Object[] pdus                   = (Object[])intent.getExtras().get("pdus");
-//    ArrayList<IncomingTextMessage> messages = new ArrayList<IncomingTextMessage>(pdus.length);
-//
-//    for (int i=0;i<pdus.length;i++)
-//      messages.add(new IncomingTextMessage(SmsMessage.createFromPdu((byte[])pdus[i])));
-//
-//    return messages;
-//  }
-
   private boolean isRelevant(Context context, Intent intent) {
     SmsMessage message = getSmsMessageFromIntent(intent);
     String messageBody = getSmsMessageBodyFromIntent(intent);
@@ -104,73 +87,25 @@ public class SmsListener extends BroadcastReceiver {
     if (!ApplicationMigrationService.isDatabaseImported(context))
       return false;
 
-    if (isChallenge(context, intent))
+    if (SMS_RECEIVED_ACTION.equals(intent.getAction()) && Util.isDefaultSmsProvider(context)) {
       return false;
-
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT &&
-        SMS_RECEIVED_ACTION.equals(intent.getAction()) &&
-        Util.isDefaultSmsProvider(context))
-    {
-      return false;
-    }
-
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.KITKAT &&
-        TextSecurePreferences.isInterceptAllSmsEnabled(context))
-    {
-      return true;
     }
 
     return false;
-  }
-
-  private boolean isChallenge(Context context, Intent intent) {
-    String messageBody = getSmsMessageBodyFromIntent(intent);
-
-    if (messageBody == null)
-      return false;
-
-    if (CHALLENGE_PATTERN.matcher(messageBody).matches() &&
-        TextSecurePreferences.isVerifying(context))
-    {
-      return true;
-    }
-
-    return false;
-  }
-
-  private String parseChallenge(Context context, Intent intent) {
-    String  messageBody      = getSmsMessageBodyFromIntent(intent);
-    Matcher challengeMatcher = CHALLENGE_PATTERN.matcher(messageBody);
-
-    if (!challengeMatcher.matches()) {
-      throw new AssertionError("Expression should match.");
-    }
-
-    return challengeMatcher.group(1) + challengeMatcher.group(2);
   }
 
   @Override
   public void onReceive(Context context, Intent intent) {
-    Log.w("SMSListener", "Got SMS broadcast...");
+    Log.i("SMSListener", "Got SMS broadcast...");
 
-    if (SMS_RECEIVED_ACTION.equals(intent.getAction()) && isChallenge(context, intent)) {
-      Log.w("SmsListener", "Got challenge!");
-      Intent challengeIntent = new Intent(RegistrationService.CHALLENGE_EVENT);
-      challengeIntent.putExtra(RegistrationService.CHALLENGE_EXTRA, parseChallenge(context, intent));
-      context.sendBroadcast(challengeIntent);
-
-      abortBroadcast();
-    } else if ((intent.getAction().equals(SMS_DELIVERED_ACTION)) ||
-               (intent.getAction().equals(SMS_RECEIVED_ACTION)) && isRelevant(context, intent))
+    if ((intent.getAction().equals(SMS_DELIVERED_ACTION)) ||
+        (intent.getAction().equals(SMS_RECEIVED_ACTION)) && isRelevant(context, intent))
     {
-      Object[] pdus = (Object[])intent.getExtras().get("pdus");
-      ApplicationContext.getInstance(context).getJobManager().add(new SmsReceiveJob(context, pdus));
+      Log.i("SmsListener", "Constructing SmsReceiveJob...");
+      Object[] pdus           = (Object[]) intent.getExtras().get("pdus");
+      int      subscriptionId = intent.getExtras().getInt("subscription", -1);
 
-//      Intent receivedIntent = new Intent(context, SendReceiveService.class);
-//      receivedIntent.setAction(SendReceiveService.RECEIVE_SMS_ACTION);
-//      receivedIntent.putExtra("ResultCode", this.getResultCode());
-//      receivedIntent.putParcelableArrayListExtra("text_messages",getAsTextMessages(intent));
-//      context.startService(receivedIntent);
+      ApplicationContext.getInstance(context).getJobManager().add(new SmsReceiveJob(pdus, subscriptionId));
 
       abortBroadcast();
     }

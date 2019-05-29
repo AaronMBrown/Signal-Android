@@ -1,103 +1,108 @@
 package org.thoughtcrime.securesms.mms;
 
-import android.text.TextUtils;
-import android.util.Log;
-
-import org.thoughtcrime.securesms.crypto.MasterSecretUnion;
-import org.thoughtcrime.securesms.crypto.MediaKey;
-import org.thoughtcrime.securesms.database.PartDatabase;
+import org.thoughtcrime.securesms.attachments.Attachment;
+import org.thoughtcrime.securesms.attachments.PointerAttachment;
+import org.thoughtcrime.securesms.contactshare.Contact;
+import org.thoughtcrime.securesms.database.Address;
+import org.thoughtcrime.securesms.linkpreview.LinkPreview;
 import org.thoughtcrime.securesms.util.GroupUtil;
-import org.thoughtcrime.securesms.util.Util;
-import org.whispersystems.libaxolotl.util.guava.Optional;
-import org.whispersystems.textsecure.api.messages.TextSecureAttachment;
-import org.whispersystems.textsecure.api.messages.TextSecureGroup;
+import org.whispersystems.libsignal.util.guava.Optional;
+import org.whispersystems.signalservice.api.messages.SignalServiceAttachment;
+import org.whispersystems.signalservice.api.messages.SignalServiceGroup;
 
+import java.util.Collections;
+import java.util.LinkedList;
 import java.util.List;
-
-import ws.com.google.android.mms.pdu.CharacterSets;
-import ws.com.google.android.mms.pdu.EncodedStringValue;
-import ws.com.google.android.mms.pdu.PduBody;
-import ws.com.google.android.mms.pdu.PduHeaders;
-import ws.com.google.android.mms.pdu.PduPart;
-import ws.com.google.android.mms.pdu.RetrieveConf;
 
 public class IncomingMediaMessage {
 
-  private final PduHeaders headers;
-  private final PduBody    body;
-  private final String     groupId;
-  private final boolean    push;
+  private final Address       from;
+  private final Address       groupId;
+  private final String        body;
+  private final boolean       push;
+  private final long          sentTimeMillis;
+  private final int           subscriptionId;
+  private final long          expiresIn;
+  private final boolean       expirationUpdate;
+  private final QuoteModel    quote;
+  private final boolean       unidentified;
 
-  public IncomingMediaMessage(RetrieveConf retrieved) {
-    this.headers = retrieved.getPduHeaders();
-    this.body    = retrieved.getBody();
-    this.groupId = null;
-    this.push    = false;
-  }
+  private final List<Attachment>  attachments    = new LinkedList<>();
+  private final List<Contact>     sharedContacts = new LinkedList<>();
+  private final List<LinkPreview> linkPreviews   = new LinkedList<>();
 
-  public IncomingMediaMessage(MasterSecretUnion masterSecret,
-                              String from,
-                              String to,
+  public IncomingMediaMessage(Address from,
+                              Optional<Address> groupId,
+                              String body,
                               long sentTimeMillis,
-                              Optional<String> relay,
-                              Optional<String> body,
-                              Optional<TextSecureGroup> group,
-                              Optional<List<TextSecureAttachment>> attachments)
+                              List<Attachment> attachments,
+                              int subscriptionId,
+                              long expiresIn,
+                              boolean expirationUpdate,
+                              boolean unidentified)
   {
-    this.headers = new PduHeaders();
-    this.body    = new PduBody();
-    this.push    = true;
+    this.from             = from;
+    this.groupId          = groupId.orNull();
+    this.sentTimeMillis   = sentTimeMillis;
+    this.body             = body;
+    this.push             = false;
+    this.subscriptionId   = subscriptionId;
+    this.expiresIn        = expiresIn;
+    this.expirationUpdate = expirationUpdate;
+    this.quote            = null;
+    this.unidentified     = unidentified;
 
-    if (group.isPresent()) {
-      this.groupId = GroupUtil.getEncodedId(group.get().getGroupId());
-    } else {
-      this.groupId = null;
-    }
-
-    this.headers.setEncodedStringValue(new EncodedStringValue(from), PduHeaders.FROM);
-    this.headers.appendEncodedStringValue(new EncodedStringValue(to), PduHeaders.TO);
-    this.headers.setLongInteger(sentTimeMillis / 1000, PduHeaders.DATE);
-
-
-    if (body.isPresent() && !TextUtils.isEmpty(body.get())) {
-      PduPart text = new PduPart();
-      text.setData(Util.toUtf8Bytes(body.get()));
-      text.setContentType(Util.toIsoBytes("text/plain"));
-      text.setCharset(CharacterSets.UTF_8);
-      this.body.addPart(text);
-    }
-
-    if (attachments.isPresent()) {
-      for (TextSecureAttachment attachment : attachments.get()) {
-        if (attachment.isPointer()) {
-          PduPart media        = new PduPart();
-          String  encryptedKey = MediaKey.getEncrypted(masterSecret, attachment.asPointer().getKey());
-
-          media.setContentType(Util.toIsoBytes(attachment.getContentType()));
-          media.setContentLocation(Util.toIsoBytes(String.valueOf(attachment.asPointer().getId())));
-          media.setContentDisposition(Util.toIsoBytes(encryptedKey));
-
-          if (relay.isPresent()) {
-            media.setName(Util.toIsoBytes(relay.get()));
-          }
-
-          media.setTransferProgress(PartDatabase.TRANSFER_PROGRESS_AUTO_PENDING);
-
-          this.body.addPart(media);
-        }
-      }
-    }
+    this.attachments.addAll(attachments);
   }
 
-  public PduHeaders getPduHeaders() {
-    return headers;
+  public IncomingMediaMessage(Address from,
+                              long sentTimeMillis,
+                              int subscriptionId,
+                              long expiresIn,
+                              boolean expirationUpdate,
+                              boolean unidentified,
+                              Optional<String> body,
+                              Optional<SignalServiceGroup> group,
+                              Optional<List<SignalServiceAttachment>> attachments,
+                              Optional<QuoteModel> quote,
+                              Optional<List<Contact>> sharedContacts,
+                              Optional<List<LinkPreview>> linkPreviews)
+  {
+    this.push             = true;
+    this.from             = from;
+    this.sentTimeMillis   = sentTimeMillis;
+    this.body             = body.orNull();
+    this.subscriptionId   = subscriptionId;
+    this.expiresIn        = expiresIn;
+    this.expirationUpdate = expirationUpdate;
+    this.quote            = quote.orNull();
+    this.unidentified     = unidentified;
+
+    if (group.isPresent()) this.groupId = Address.fromSerialized(GroupUtil.getEncodedId(group.get().getGroupId(), false));
+    else                   this.groupId = null;
+
+    this.attachments.addAll(PointerAttachment.forPointers(attachments));
+    this.sharedContacts.addAll(sharedContacts.or(Collections.emptyList()));
+    this.linkPreviews.addAll(linkPreviews.or(Collections.emptyList()));
   }
 
-  public PduBody getBody() {
+  public int getSubscriptionId() {
+    return subscriptionId;
+  }
+
+  public String getBody() {
     return body;
   }
 
-  public String getGroupId() {
+  public List<Attachment> getAttachments() {
+    return attachments;
+  }
+
+  public Address getFrom() {
+    return from;
+  }
+
+  public Address getGroupId() {
     return groupId;
   }
 
@@ -105,10 +110,35 @@ public class IncomingMediaMessage {
     return push;
   }
 
+  public boolean isExpirationUpdate() {
+    return expirationUpdate;
+  }
+
+  public long getSentTimeMillis() {
+    return sentTimeMillis;
+  }
+
+  public long getExpiresIn() {
+    return expiresIn;
+  }
+
   public boolean isGroupMessage() {
-    return groupId != null                                           ||
-        !Util.isEmpty(headers.getEncodedStringValues(PduHeaders.CC)) ||
-        (headers.getEncodedStringValues(PduHeaders.TO) != null &&
-         headers.getEncodedStringValues(PduHeaders.TO).length > 1);
+    return groupId != null;
+  }
+
+  public QuoteModel getQuote() {
+    return quote;
+  }
+
+  public List<Contact> getSharedContacts() {
+    return sharedContacts;
+  }
+
+  public List<LinkPreview> getLinkPreviews() {
+    return linkPreviews;
+  }
+
+  public boolean isUnidentified() {
+    return unidentified;
   }
 }

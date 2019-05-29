@@ -15,30 +15,39 @@ import android.view.ViewGroup;
 import android.widget.FrameLayout;
 import android.widget.TextView;
 
+import com.annimon.stream.Stream;
 import com.nineoldandroids.animation.Animator;
 import com.nineoldandroids.animation.ValueAnimator;
-import com.nineoldandroids.animation.ValueAnimator.AnimatorUpdateListener;
 import com.pnikosis.materialishprogress.ProgressWheel;
 
+import org.greenrobot.eventbus.EventBus;
+import org.greenrobot.eventbus.Subscribe;
+import org.greenrobot.eventbus.ThreadMode;
 import org.thoughtcrime.securesms.R;
-import org.thoughtcrime.securesms.database.PartDatabase;
-import org.thoughtcrime.securesms.jobs.PartProgressEvent;
+import org.thoughtcrime.securesms.attachments.Attachment;
+import org.thoughtcrime.securesms.database.AttachmentDatabase;
+import org.thoughtcrime.securesms.events.PartProgressEvent;
 import org.thoughtcrime.securesms.mms.Slide;
-import org.thoughtcrime.securesms.util.Util;
 import org.thoughtcrime.securesms.util.ViewUtil;
 
-import de.greenrobot.event.EventBus;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 public class TransferControlView extends FrameLayout {
   private static final int TRANSITION_MS = 300;
 
-  @Nullable private Slide slide;
-  @Nullable private View  current;
+  @Nullable private List<Slide> slides;
+  @Nullable private View        current;
 
   private final ProgressWheel progressWheel;
-  private final TextView      downloadDetails;
+  private final View          downloadDetails;
+  private final TextView      downloadDetailsText;
   private final int           contractedWidth;
   private final int           expandedWidth;
+
+  private final Map<Attachment, Float> downloadProgress;
 
   public TransferControlView(Context context) {
     this(context, null);
@@ -53,17 +62,19 @@ public class TransferControlView extends FrameLayout {
     inflate(context, R.layout.transfer_controls_view, this);
 
     final Drawable background = ContextCompat.getDrawable(context, R.drawable.transfer_controls_background);
-    if (VERSION.SDK_INT >= VERSION_CODES.ICE_CREAM_SANDWICH) {
+    if (VERSION.SDK_INT >= VERSION_CODES.JELLY_BEAN_MR1) {
       background.setColorFilter(0x66ffffff, Mode.MULTIPLY);
     }
     setLongClickable(false);
     ViewUtil.setBackground(this, background);
     setVisibility(GONE);
 
-    this.progressWheel   = ViewUtil.findById(this, R.id.progress_wheel);
-    this.downloadDetails = ViewUtil.findById(this, R.id.download_details);
-    this.contractedWidth = getResources().getDimensionPixelSize(R.dimen.transfer_controls_contracted_width);
-    this.expandedWidth   = getResources().getDimensionPixelSize(R.dimen.transfer_controls_expanded_width);
+    this.downloadProgress    = new HashMap<>();
+    this.progressWheel       = ViewUtil.findById(this, R.id.progress_wheel);
+    this.downloadDetails     = ViewUtil.findById(this, R.id.download_details);
+    this.downloadDetailsText = ViewUtil.findById(this, R.id.download_details_text);
+    this.contractedWidth     = getResources().getDimensionPixelSize(R.dimen.transfer_controls_contracted_width);
+    this.expandedWidth       = getResources().getDimensionPixelSize(R.dimen.transfer_controls_expanded_width);
   }
 
   @Override
@@ -81,7 +92,7 @@ public class TransferControlView extends FrameLayout {
   @Override
   protected void onAttachedToWindow() {
     super.onAttachedToWindow();
-    if (!EventBus.getDefault().isRegistered(this)) EventBus.getDefault().registerSticky(this);
+    if (!EventBus.getDefault().isRegistered(this)) EventBus.getDefault().register(this);
   }
 
   @Override
@@ -90,20 +101,54 @@ public class TransferControlView extends FrameLayout {
     EventBus.getDefault().unregister(this);
   }
 
-  public void setSlide(final @NonNull Slide slide) {
-    this.slide = slide;
-    if (slide.getTransferProgress() == PartDatabase.TRANSFER_PROGRESS_STARTED) {
-      showProgressSpinner();
-    } else if (slide.isPendingDownload()) {
-      downloadDetails.setText(slide.getContentDescription());
-      display(downloadDetails);
-    } else {
-      display(null);
+  public void setSlide(final @NonNull Slide slides) {
+    setSlides(Collections.singletonList(slides));
+  }
+
+  public void setSlides(final @NonNull List<Slide> slides) {
+    if (slides.isEmpty()) {
+      throw new IllegalArgumentException("Must provide at least one slide.");
+    }
+
+    this.slides = slides;
+
+    if (!isUpdateToExistingSet(slides)) {
+      downloadProgress.clear();
+      Stream.of(slides).forEach(s -> downloadProgress.put(s.asAttachment(), 0f));
+    }
+    
+    for (Slide slide : slides) {
+      if (slide.asAttachment().getTransferState() == AttachmentDatabase.TRANSFER_PROGRESS_DONE) {
+        downloadProgress.put(slide.asAttachment(), 1f);
+      }
+    }
+
+    switch (getTransferState(slides)) {
+      case AttachmentDatabase.TRANSFER_PROGRESS_STARTED:
+        showProgressSpinner(calculateProgress(downloadProgress));
+        break;
+      case AttachmentDatabase.TRANSFER_PROGRESS_PENDING:
+      case AttachmentDatabase.TRANSFER_PROGRESS_FAILED:
+        downloadDetailsText.setText(getDownloadText(this.slides));
+        display(downloadDetails);
+        break;
+      default:
+        display(null);
+        break;
     }
   }
 
   public void showProgressSpinner() {
-    progressWheel.spin();
+    showProgressSpinner(calculateProgress(downloadProgress));
+  }
+
+  public void showProgressSpinner(float progress) {
+    if (progress == 0) {
+      progressWheel.spin();
+    } else {
+      progressWheel.setInstantProgress(progress);
+    }
+
     display(progressWheel);
   }
 
@@ -119,12 +164,52 @@ public class TransferControlView extends FrameLayout {
       current.setVisibility(GONE);
     }
     current = null;
-    slide   = null;
+    slides = null;
+  }
+
+  public void setShowDownloadText(boolean showDownloadText) {
+    downloadDetailsText.setVisibility(showDownloadText ? VISIBLE : GONE);
+    forceLayout();
+  }
+
+  private boolean isUpdateToExistingSet(@NonNull List<Slide> slides) {
+    if (slides.size() != downloadProgress.size()) {
+      return false;
+    }
+
+    for (Slide slide : slides) {
+      if (!downloadProgress.containsKey(slide.asAttachment())) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  private int getTransferState(@NonNull List<Slide> slides) {
+    int transferState = AttachmentDatabase.TRANSFER_PROGRESS_DONE;
+    for (Slide slide : slides) {
+      if (slide.getTransferState() == AttachmentDatabase.TRANSFER_PROGRESS_PENDING && transferState == AttachmentDatabase.TRANSFER_PROGRESS_DONE) {
+        transferState = slide.getTransferState();
+      } else {
+        transferState = Math.max(transferState, slide.getTransferState());
+      }
+    }
+    return transferState;
+  }
+
+  private String getDownloadText(@NonNull List<Slide> slides) {
+    if (slides.size() == 1) {
+      return slides.get(0).getContentDescription();
+    } else {
+      int downloadCount = Stream.of(slides).reduce(0, (count, slide) -> slide.getTransferState() != AttachmentDatabase.TRANSFER_PROGRESS_DONE ? count + 1 : count);
+      return getContext().getResources().getQuantityString(R.plurals.TransferControlView_n_items, downloadCount, downloadCount);
+    }
   }
 
   private void display(@Nullable final View view) {
-    final int sourceWidth = current == downloadDetails ? expandedWidth : contractedWidth;
-    final int targetWidth = view    == downloadDetails ? expandedWidth : contractedWidth;
+    final int sourceWidth = (current == downloadDetails && downloadDetailsText.getVisibility() == VISIBLE) ? expandedWidth : contractedWidth;
+    final int targetWidth = (view    == downloadDetails && downloadDetailsText.getVisibility() == VISIBLE) ? expandedWidth : contractedWidth;
 
     if (current == view || current == null) {
       ViewGroup.LayoutParams layoutParams = getLayoutParams();
@@ -148,29 +233,30 @@ public class TransferControlView extends FrameLayout {
 
   private Animator getWidthAnimator(final int from, final int to) {
     final ValueAnimator anim = ValueAnimator.ofInt(from, to);
-    anim.addUpdateListener(new AnimatorUpdateListener() {
-      @Override
-      public void onAnimationUpdate(ValueAnimator animation) {
-        final int val = (Integer)animation.getAnimatedValue();
-        final ViewGroup.LayoutParams layoutParams = getLayoutParams();
-        layoutParams.width = val;
-        setLayoutParams(layoutParams);
-      }
+    anim.addUpdateListener(animation -> {
+      final int val = (Integer)animation.getAnimatedValue();
+      final ViewGroup.LayoutParams layoutParams = getLayoutParams();
+      layoutParams.width = val;
+      setLayoutParams(layoutParams);
     });
     anim.setInterpolator(new FastOutSlowInInterpolator());
     anim.setDuration(TRANSITION_MS);
     return anim;
   }
 
-  @SuppressWarnings("unused")
+  private float calculateProgress(@NonNull Map<Attachment, Float> downloadProgress) {
+    float totalProgress = 0;
+    for (float progress : downloadProgress.values()) {
+      totalProgress +=  progress / downloadProgress.size();
+    }
+    return totalProgress;
+  }
+
+  @Subscribe(sticky = true, threadMode = ThreadMode.MAIN)
   public void onEventAsync(final PartProgressEvent event) {
-    if (this.slide != null && event.partId.equals(this.slide.getPart().getPartId())) {
-      Util.runOnMain(new Runnable() {
-        @Override
-        public void run() {
-          progressWheel.setInstantProgress(((float)event.progress) / event.total);
-        }
-      });
+    if (downloadProgress.containsKey(event.attachment)) {
+      downloadProgress.put(event.attachment, ((float) event.progress) / event.total);
+      progressWheel.setInstantProgress(calculateProgress(downloadProgress));
     }
   }
 }

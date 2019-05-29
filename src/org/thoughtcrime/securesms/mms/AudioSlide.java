@@ -21,23 +21,39 @@ import android.content.res.Resources.Theme;
 import android.net.Uri;
 import android.support.annotation.DrawableRes;
 import android.support.annotation.NonNull;
+import android.support.annotation.Nullable;
 
 import org.thoughtcrime.securesms.R;
+import org.thoughtcrime.securesms.attachments.Attachment;
+import org.thoughtcrime.securesms.attachments.UriAttachment;
+import org.thoughtcrime.securesms.database.AttachmentDatabase;
+import org.thoughtcrime.securesms.util.MediaUtil;
 import org.thoughtcrime.securesms.util.ResUtil;
 
-import java.io.IOException;
-
-import ws.com.google.android.mms.ContentType;
-import ws.com.google.android.mms.pdu.PduPart;
 
 public class AudioSlide extends Slide {
 
-  public AudioSlide(Context context, Uri uri, long dataSize) throws IOException {
-    super(context, constructPartFromUri(context, uri, ContentType.AUDIO_UNSPECIFIED, dataSize));
+  public AudioSlide(Context context, Uri uri, long dataSize, boolean voiceNote) {
+    super(context, constructAttachmentFromUri(context, uri, MediaUtil.AUDIO_UNSPECIFIED, dataSize, 0, 0, false, null, null, voiceNote, false));
   }
 
-  public AudioSlide(Context context, PduPart part) {
-    super(context, part);
+  public AudioSlide(Context context, Uri uri, long dataSize, String contentType, boolean voiceNote) {
+    super(context,  new UriAttachment(uri, null, contentType, AttachmentDatabase.TRANSFER_PROGRESS_STARTED, dataSize, 0, 0, null, null, voiceNote, false, null));
+  }
+
+  public AudioSlide(Context context, Attachment attachment) {
+    super(context, attachment);
+  }
+
+  @Override
+  @Nullable
+  public Uri getThumbnailUri() {
+    return null;
+  }
+
+  @Override
+  public boolean hasPlaceholder() {
+    return true;
   }
 
   @Override
@@ -50,7 +66,9 @@ public class AudioSlide extends Slide {
     return true;
   }
 
-  @NonNull @Override public String getContentDescription() {
+  @NonNull
+  @Override
+  public String getContentDescription() {
     return context.getString(R.string.Slide_audio);
   }
 

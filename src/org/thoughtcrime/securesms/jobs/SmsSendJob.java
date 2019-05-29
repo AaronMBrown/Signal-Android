@@ -4,114 +4,161 @@ import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
+import android.os.Build;
+import android.support.annotation.NonNull;
+import android.telephony.PhoneNumberUtils;
 import android.telephony.SmsManager;
-import android.util.Log;
 
-import org.thoughtcrime.securesms.crypto.MasterSecret;
+import org.thoughtcrime.securesms.jobmanager.Data;
+import org.thoughtcrime.securesms.jobmanager.Job;
+import org.thoughtcrime.securesms.jobmanager.impl.NetworkOrCellServiceConstraint;
+import org.thoughtcrime.securesms.jobmanager.impl.CellServiceConstraint;
+
 import org.thoughtcrime.securesms.database.DatabaseFactory;
-import org.thoughtcrime.securesms.database.EncryptingSmsDatabase;
 import org.thoughtcrime.securesms.database.NoSuchMessageException;
 import org.thoughtcrime.securesms.database.SmsDatabase;
 import org.thoughtcrime.securesms.database.model.SmsMessageRecord;
-import org.thoughtcrime.securesms.jobs.requirements.MasterSecretRequirement;
-import org.thoughtcrime.securesms.jobs.requirements.NetworkOrServiceRequirement;
-import org.thoughtcrime.securesms.jobs.requirements.ServiceRequirement;
 import org.thoughtcrime.securesms.notifications.MessageNotifier;
-import org.thoughtcrime.securesms.recipients.Recipients;
+import org.thoughtcrime.securesms.recipients.Recipient;
 import org.thoughtcrime.securesms.service.SmsDeliveryListener;
-import org.thoughtcrime.securesms.transport.InsecureFallbackApprovalException;
 import org.thoughtcrime.securesms.transport.UndeliverableMessageException;
 import org.thoughtcrime.securesms.util.NumberUtil;
 import org.thoughtcrime.securesms.util.TextSecurePreferences;
-import org.whispersystems.jobqueue.JobParameters;
 
 import java.util.ArrayList;
 
 public class SmsSendJob extends SendJob {
 
-  private static final String TAG = SmsSendJob.class.getSimpleName();
+  public static final String KEY = "SmsSendJob";
 
-  private final long messageId;
+  private static final String TAG              = SmsSendJob.class.getSimpleName();
+  private static final int    MAX_ATTEMPTS     = 15;
+  private static final String KEY_MESSAGE_ID   = "message_id";
+  private static final String KEY_RUN_ATTEMPT  = "run_attempt";
+
+  private long messageId;
+  private int  runAttempt;
 
   public SmsSendJob(Context context, long messageId, String name) {
-    super(context, constructParameters(context, name));
-    this.messageId = messageId;
+    this(context, messageId, name, 0);
+  }
+
+  public SmsSendJob(Context context, long messageId, String name, int runAttempt) {
+    this(constructParameters(context, name), messageId, runAttempt);
+  }
+
+  private SmsSendJob(@NonNull Job.Parameters parameters, long messageId, int runAttempt) {
+    super(parameters);
+
+    this.messageId  = messageId;
+    this.runAttempt = runAttempt;
   }
 
   @Override
-  public void onAdded() {
-    SmsDatabase database = DatabaseFactory.getEncryptingSmsDatabase(context);
-    database.markAsSending(messageId);
+  public @NonNull Data serialize() {
+    return new Data.Builder().putLong(KEY_MESSAGE_ID, messageId)
+                             .putInt(KEY_RUN_ATTEMPT, runAttempt)
+                             .build();
   }
 
   @Override
-  public void onSend(MasterSecret masterSecret) throws NoSuchMessageException {
-    EncryptingSmsDatabase database = DatabaseFactory.getEncryptingSmsDatabase(context);
-    SmsMessageRecord      record   = database.getMessage(masterSecret, messageId);
+  public @NonNull String getFactoryKey() {
+    return KEY;
+  }
+
+  @Override
+  public void onSend() throws NoSuchMessageException, TooManyRetriesException {
+    if (runAttempt >= MAX_ATTEMPTS) {
+      warn(TAG, "Hit the retry limit. Failing.");
+      throw new TooManyRetriesException();
+    }
+
+    SmsDatabase      database = DatabaseFactory.getSmsDatabase(context);
+    SmsMessageRecord record   = database.getMessage(messageId);
+
+    if (!record.isPending() && !record.isFailed()) {
+      warn(TAG, "Message " + messageId + " was already sent. Ignoring.");
+      return;
+    }
 
     try {
-      Log.w(TAG, "Sending message: " + messageId);
-
+      log(TAG, "Sending message: " + messageId + " (attempt " + runAttempt + ")");
       deliver(record);
+      log(TAG, "Sent message: " + messageId);
     } catch (UndeliverableMessageException ude) {
-      Log.w(TAG, ude);
+      warn(TAG, ude);
       DatabaseFactory.getSmsDatabase(context).markAsSentFailed(record.getId());
-      MessageNotifier.notifyMessageDeliveryFailed(context, record.getRecipients(), record.getThreadId());
+      MessageNotifier.notifyMessageDeliveryFailed(context, record.getRecipient(), record.getThreadId());
     }
   }
 
   @Override
-  public boolean onShouldRetryThrowable(Exception throwable) {
+  public boolean onShouldRetry(Exception throwable) {
     return false;
   }
 
   @Override
   public void onCanceled() {
-    Log.w(TAG, "onCanceled()");
-    long       threadId   = DatabaseFactory.getSmsDatabase(context).getThreadIdForMessage(messageId);
-    Recipients recipients = DatabaseFactory.getThreadDatabase(context).getRecipientsForThreadId(threadId);
+    warn(TAG, "onCanceled() messageId: " + messageId);
+    long      threadId  = DatabaseFactory.getSmsDatabase(context).getThreadIdForMessage(messageId);
+    Recipient recipient = DatabaseFactory.getThreadDatabase(context).getRecipientForThreadId(threadId);
 
     DatabaseFactory.getSmsDatabase(context).markAsSentFailed(messageId);
-    MessageNotifier.notifyMessageDeliveryFailed(context, recipients, threadId);
+
+    if (threadId != -1 && recipient != null) {
+      MessageNotifier.notifyMessageDeliveryFailed(context, recipient, threadId);
+    }
   }
 
   private void deliver(SmsMessageRecord message)
       throws UndeliverableMessageException
   {
-    if (!NumberUtil.isValidSmsOrEmail(message.getIndividualRecipient().getNumber())) {
-      throw new UndeliverableMessageException("Not a valid SMS destination! " + message.getIndividualRecipient().getNumber());
-    }
-
     if (message.isSecure() || message.isKeyExchange() || message.isEndSession()) {
       throw new UndeliverableMessageException("Trying to send a secure SMS?");
     }
 
-    ArrayList<String> messages                = SmsManager.getDefault().divideMessage(message.getBody().getBody());
+    String recipient = message.getIndividualRecipient().getAddress().serialize();
+
+    // See issue #1516 for bug report, and discussion on commits related to #4833 for problems
+    // related to the original fix to #1516. This still may not be a correct fix if networks allow
+    // SMS/MMS sending to alphanumeric recipients other than email addresses, but should also
+    // help to fix issue #3099.
+    if (!NumberUtil.isValidEmail(recipient)) {
+      recipient = PhoneNumberUtils.stripSeparators(PhoneNumberUtils.convertKeypadLettersToDigits(recipient));
+    }
+
+    if (!NumberUtil.isValidSmsOrEmail(recipient)) {
+      throw new UndeliverableMessageException("Not a valid SMS destination! " + recipient);
+    }
+
+    ArrayList<String> messages                = SmsManager.getDefault().divideMessage(message.getBody());
     ArrayList<PendingIntent> sentIntents      = constructSentIntents(message.getId(), message.getType(), messages, false);
     ArrayList<PendingIntent> deliveredIntents = constructDeliveredIntents(message.getId(), message.getType(), messages);
-    String recipient                          = message.getIndividualRecipient().getNumber();
 
     // NOTE 11/04/14 -- There's apparently a bug where for some unknown recipients
     // and messages, this will throw an NPE.  We have no idea why, so we're just
     // catching it and marking the message as a failure.  That way at least it doesn't
     // repeatedly crash every time you start the app.
     try {
-      SmsManager.getDefault().sendMultipartTextMessage(recipient, null, messages, sentIntents, deliveredIntents);
-    } catch (NullPointerException npe) {
-      Log.w(TAG, npe);
-      Log.w(TAG, "Recipient: " + recipient);
-      Log.w(TAG, "Message Parts: " + messages.size());
+      getSmsManagerFor(message.getSubscriptionId()).sendMultipartTextMessage(recipient, null, messages, sentIntents, deliveredIntents);
+    } catch (NullPointerException | IllegalArgumentException npe) {
+      warn(TAG, npe);
+      log(TAG, "Recipient: " + recipient);
+      log(TAG, "Message Parts: " + messages.size());
 
       try {
         for (int i=0;i<messages.size();i++) {
-          SmsManager.getDefault().sendTextMessage(recipient, null, messages.get(i),
-                                                  sentIntents.get(i),
-                                                  deliveredIntents == null ? null : deliveredIntents.get(i));
+          getSmsManagerFor(message.getSubscriptionId()).sendTextMessage(recipient, null, messages.get(i),
+                                                                        sentIntents.get(i),
+                                                                        deliveredIntents == null ? null : deliveredIntents.get(i));
         }
-      } catch (NullPointerException npe2) {
-        Log.w(TAG, npe);
+      } catch (NullPointerException | IllegalArgumentException npe2) {
+        warn(TAG, npe);
         throw new UndeliverableMessageException(npe2);
       }
+    } catch (SecurityException se) {
+      warn(TAG, se);
+      throw new UndeliverableMessageException(se);
     }
   }
 
@@ -154,6 +201,7 @@ public class SmsSendJob extends SendJob {
 
     pending.putExtra("type", type);
     pending.putExtra("message_id", messageId);
+    pending.putExtra("run_attempt", Math.max(runAttempt, getRunAttempt()));
     pending.putExtra("upgraded", upgraded);
     pending.putExtra("push", push);
 
@@ -170,20 +218,30 @@ public class SmsSendJob extends SendJob {
     return pending;
   }
 
-  private static JobParameters constructParameters(Context context, String name) {
-    JobParameters.Builder builder = JobParameters.newBuilder()
-                                                 .withPersistence()
-                                                 .withRequirement(new MasterSecretRequirement(context))
-                                                 .withGroupId(name);
-
-    if (TextSecurePreferences.isWifiSmsEnabled(context)) {
-      builder.withRequirement(new NetworkOrServiceRequirement(context));
+  private SmsManager getSmsManagerFor(int subscriptionId) {
+    if (Build.VERSION.SDK_INT >= 22 && subscriptionId != -1) {
+      return SmsManager.getSmsManagerForSubscriptionId(subscriptionId);
     } else {
-      builder.withRequirement(new ServiceRequirement(context));
+      return SmsManager.getDefault();
     }
-
-    return builder.create();
   }
 
+  private static Job.Parameters constructParameters(@NonNull Context context, String name) {
+    String constraint = TextSecurePreferences.isWifiSmsEnabled(context) ? NetworkOrCellServiceConstraint.KEY
+                                                                        : CellServiceConstraint.KEY;
+    return new Job.Parameters.Builder()
+                             .setMaxAttempts(MAX_ATTEMPTS)
+                             .setQueue(name)
+                             .addConstraint(constraint)
+                             .build();
+  }
 
+  private static class TooManyRetriesException extends Exception { }
+
+  public static class Factory implements Job.Factory<SmsSendJob> {
+    @Override
+    public @NonNull SmsSendJob create(@NonNull Parameters parameters, @NonNull org.thoughtcrime.securesms.jobmanager.Data data) {
+      return new SmsSendJob(parameters, data.getLong(KEY_MESSAGE_ID), data.getInt(KEY_RUN_ATTEMPT));
+    }
+  }
 }

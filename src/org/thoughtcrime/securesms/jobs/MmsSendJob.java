@@ -1,79 +1,114 @@
 package org.thoughtcrime.securesms.jobs;
 
 import android.content.Context;
-import android.os.Build.VERSION;
-import android.os.Build.VERSION_CODES;
-import android.util.Log;
+import android.support.annotation.NonNull;
+import android.text.TextUtils;
 
-import org.thoughtcrime.securesms.crypto.MasterSecret;
+import org.thoughtcrime.securesms.jobmanager.Data;
+import org.thoughtcrime.securesms.jobmanager.Job;
+import org.thoughtcrime.securesms.jobmanager.impl.NetworkConstraint;
+import org.thoughtcrime.securesms.logging.Log;
+import android.webkit.MimeTypeMap;
+
+import com.android.mms.dom.smil.parser.SmilXmlSerializer;
+import com.google.android.mms.ContentType;
+import com.google.android.mms.InvalidHeaderValueException;
+import com.google.android.mms.pdu_alt.CharacterSets;
+import com.google.android.mms.pdu_alt.EncodedStringValue;
+import com.google.android.mms.pdu_alt.PduBody;
+import com.google.android.mms.pdu_alt.PduComposer;
+import com.google.android.mms.pdu_alt.PduHeaders;
+import com.google.android.mms.pdu_alt.PduPart;
+import com.google.android.mms.pdu_alt.SendConf;
+import com.google.android.mms.pdu_alt.SendReq;
+import com.google.android.mms.smil.SmilHelper;
+import com.klinker.android.send_message.Utils;
+
+import org.thoughtcrime.securesms.attachments.Attachment;
+import org.thoughtcrime.securesms.database.Address;
 import org.thoughtcrime.securesms.database.DatabaseFactory;
 import org.thoughtcrime.securesms.database.MmsDatabase;
 import org.thoughtcrime.securesms.database.NoSuchMessageException;
-import org.thoughtcrime.securesms.jobs.requirements.MasterSecretRequirement;
-import org.thoughtcrime.securesms.mms.ApnUnavailableException;
+import org.thoughtcrime.securesms.database.ThreadDatabase;
 import org.thoughtcrime.securesms.mms.CompatMmsConnection;
 import org.thoughtcrime.securesms.mms.MediaConstraints;
+import org.thoughtcrime.securesms.mms.MmsException;
 import org.thoughtcrime.securesms.mms.MmsSendResult;
-import org.thoughtcrime.securesms.mms.OutgoingLegacyMmsConnection;
-import org.thoughtcrime.securesms.mms.OutgoingLollipopMmsConnection;
-import org.thoughtcrime.securesms.mms.OutgoingMmsConnection;
+import org.thoughtcrime.securesms.mms.OutgoingMediaMessage;
+import org.thoughtcrime.securesms.mms.PartAuthority;
 import org.thoughtcrime.securesms.notifications.MessageNotifier;
-import org.thoughtcrime.securesms.recipients.Recipients;
+import org.thoughtcrime.securesms.recipients.Recipient;
 import org.thoughtcrime.securesms.transport.InsecureFallbackApprovalException;
 import org.thoughtcrime.securesms.transport.UndeliverableMessageException;
 import org.thoughtcrime.securesms.util.Hex;
 import org.thoughtcrime.securesms.util.NumberUtil;
-import org.thoughtcrime.securesms.util.SmilUtil;
-import org.thoughtcrime.securesms.util.TelephonyUtil;
-import org.whispersystems.jobqueue.JobParameters;
-import org.whispersystems.jobqueue.requirements.NetworkRequirement;
+import org.thoughtcrime.securesms.util.TextSecurePreferences;
+import org.thoughtcrime.securesms.util.Util;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.Arrays;
-
-import ws.com.google.android.mms.MmsException;
-import ws.com.google.android.mms.pdu.EncodedStringValue;
-import ws.com.google.android.mms.pdu.PduComposer;
-import ws.com.google.android.mms.pdu.PduHeaders;
-import ws.com.google.android.mms.pdu.SendConf;
-import ws.com.google.android.mms.pdu.SendReq;
+import java.util.List;
 
 public class MmsSendJob extends SendJob {
+
+  public static final String KEY = "MmsSendJob";
+
   private static final String TAG = MmsSendJob.class.getSimpleName();
 
-  private final long messageId;
+  private static final String KEY_MESSAGE_ID = "message_id";
 
-  public MmsSendJob(Context context, long messageId) {
-    super(context, JobParameters.newBuilder()
-                                .withGroupId("mms-operation")
-                                .withRequirement(new NetworkRequirement(context))
-                                .withRequirement(new MasterSecretRequirement(context))
-                                .withPersistence()
-                                .create());
+  private long messageId;
 
+  public MmsSendJob(long messageId) {
+    this(new Job.Parameters.Builder()
+                           .setQueue("mms-operation")
+                           .addConstraint(NetworkConstraint.KEY)
+                           .setMaxAttempts(15)
+                           .build(),
+         messageId);
+  }
+
+  private MmsSendJob(@NonNull Job.Parameters parameters, long messageId) {
+    super(parameters);
     this.messageId = messageId;
   }
 
   @Override
-  public void onAdded() {
-    MmsDatabase database = DatabaseFactory.getMmsDatabase(context);
-    database.markAsSending(messageId);
+  public @NonNull Data serialize() {
+    return new Data.Builder().putLong(KEY_MESSAGE_ID, messageId).build();
   }
 
   @Override
-  public void onSend(MasterSecret masterSecret) throws MmsException, NoSuchMessageException, IOException {
-    MmsDatabase database = DatabaseFactory.getMmsDatabase(context);
-    SendReq     message  = database.getOutgoingMessage(masterSecret, messageId);
+  public @NonNull String getFactoryKey() {
+    return KEY;
+  }
+
+  @Override
+  public void onSend() throws MmsException, NoSuchMessageException, IOException {
+    MmsDatabase          database = DatabaseFactory.getMmsDatabase(context);
+    OutgoingMediaMessage message  = database.getOutgoingMessage(messageId);
+
+    if (database.isSent(messageId)) {
+      Log.w(TAG, "Message " + messageId + " was already sent. Ignoring.");
+      return;
+    }
 
     try {
-      validateDestinations(message);
+      Log.i(TAG, "Sending message: " + messageId);
 
-      final byte[]        pduBytes = getPduBytes(masterSecret, message);
-      final SendConf      sendConf = new CompatMmsConnection(context).send(pduBytes);
-      final MmsSendResult result   = getSendResult(sendConf, message);
+      SendReq pdu = constructSendPdu(message);
 
-      database.markAsSent(messageId, result.getMessageId(), result.getResponseStatus());
-      markPartsUploaded(messageId, message.getBody());
+      validateDestinations(message, pdu);
+
+      final byte[]        pduBytes = getPduBytes(pdu);
+      final SendConf      sendConf = new CompatMmsConnection(context).send(pduBytes, message.getSubscriptionId());
+      final MmsSendResult result   = getSendResult(sendConf, pdu);
+
+      database.markAsSent(messageId, false);
+      markAttachmentsUploaded(messageId, message.getAttachments());
+
+      Log.i(TAG, "Sent message: " + messageId);
     } catch (UndeliverableMessageException | IOException e) {
       Log.w(TAG, e);
       database.markAsSentFailed(messageId);
@@ -86,31 +121,22 @@ public class MmsSendJob extends SendJob {
   }
 
   @Override
-  public boolean onShouldRetryThrowable(Exception exception) {
+  public boolean onShouldRetry(Exception exception) {
     return false;
   }
 
   @Override
   public void onCanceled() {
+    Log.i(TAG, "onCanceled() messageId: " + messageId);
     DatabaseFactory.getMmsDatabase(context).markAsSentFailed(messageId);
     notifyMediaMessageDeliveryFailed(context, messageId);
   }
 
-  private byte[] getPduBytes(MasterSecret masterSecret, SendReq message)
+  private byte[] getPduBytes(SendReq message)
       throws IOException, UndeliverableMessageException, InsecureFallbackApprovalException
   {
-    String number = TelephonyUtil.getManager(context).getLine1Number();
-
-    message = getResolvedMessage(masterSecret, message, MediaConstraints.MMS_CONSTRAINTS, true);
-    message.setBody(SmilUtil.getSmilBody(message.getBody()));
-    if (MmsDatabase.Types.isSecureType(message.getDatabaseMessageBox())) {
-      throw new UndeliverableMessageException("Attempt to send encrypted MMS?");
-    }
-
-    if (number != null && number.trim().length() != 0) {
-      message.setFrom(new EncodedStringValue(number));
-    }
     byte[] pduBytes = new PduComposer(context, message).make();
+
     if (pduBytes == null) {
       throw new UndeliverableMessageException("PDU composition failed, null payload");
     }
@@ -133,8 +159,8 @@ public class MmsSendJob extends SendJob {
   }
 
   private boolean isInconsistentResponse(SendReq message, SendConf response) {
-    Log.w(TAG, "Comparing: " + Hex.toString(message.getTransactionId()));
-    Log.w(TAG, "With:      " + Hex.toString(response.getTransactionId()));
+    Log.i(TAG, "Comparing: " + Hex.toString(message.getTransactionId()));
+    Log.i(TAG, "With:      " + Hex.toString(response.getTransactionId()));
     return !Arrays.equals(message.getTransactionId(), response.getTransactionId());
   }
 
@@ -149,7 +175,7 @@ public class MmsSendJob extends SendJob {
     }
   }
 
-  private void validateDestinations(SendReq message) throws UndeliverableMessageException {
+  private void validateDestinations(OutgoingMediaMessage media, SendReq message) throws UndeliverableMessageException {
     validateDestinations(message.getTo());
     validateDestinations(message.getCc());
     validateDestinations(message.getBcc());
@@ -157,14 +183,144 @@ public class MmsSendJob extends SendJob {
     if (message.getTo() == null && message.getCc() == null && message.getBcc() == null) {
       throw new UndeliverableMessageException("No to, cc, or bcc specified!");
     }
+
+    if (media.isSecure()) {
+      throw new UndeliverableMessageException("Attempt to send encrypted MMS?");
+    }
+  }
+
+  private SendReq constructSendPdu(OutgoingMediaMessage message)
+      throws UndeliverableMessageException
+  {
+    SendReq          req               = new SendReq();
+    String           lineNumber        = getMyNumber(context);
+    Address          destination       = message.getRecipient().getAddress();
+    MediaConstraints mediaConstraints  = MediaConstraints.getMmsMediaConstraints(message.getSubscriptionId());
+    List<Attachment> scaledAttachments = scaleAndStripExifFromAttachments(mediaConstraints, message.getAttachments());
+
+    if (!TextUtils.isEmpty(lineNumber)) {
+      req.setFrom(new EncodedStringValue(lineNumber));
+    } else {
+      req.setFrom(new EncodedStringValue(TextSecurePreferences.getLocalNumber(context)));
+    }
+
+    if (destination.isMmsGroup()) {
+      List<Recipient> members = DatabaseFactory.getGroupDatabase(context).getGroupMembers(destination.toGroupString(), false);
+
+      for (Recipient member : members) {
+        if (message.getDistributionType() == ThreadDatabase.DistributionTypes.BROADCAST) {
+          req.addBcc(new EncodedStringValue(member.getAddress().serialize()));
+        } else {
+          req.addTo(new EncodedStringValue(member.getAddress().serialize()));
+        }
+      }
+    } else {
+      req.addTo(new EncodedStringValue(destination.serialize()));
+    }
+
+    req.setDate(System.currentTimeMillis() / 1000);
+
+    PduBody body = new PduBody();
+    int     size = 0;
+
+    if (!TextUtils.isEmpty(message.getBody())) {
+      PduPart part = new PduPart();
+      String name = String.valueOf(System.currentTimeMillis());
+      part.setData(Util.toUtf8Bytes(message.getBody()));
+      part.setCharset(CharacterSets.UTF_8);
+      part.setContentType(ContentType.TEXT_PLAIN.getBytes());
+      part.setContentId(name.getBytes());
+      part.setContentLocation((name + ".txt").getBytes());
+      part.setName((name + ".txt").getBytes());
+
+      body.addPart(part);
+      size += getPartSize(part);
+    }
+
+    for (Attachment attachment : scaledAttachments) {
+      try {
+        if (attachment.getDataUri() == null) throw new IOException("Assertion failed, attachment for outgoing MMS has no data!");
+
+        String  fileName = attachment.getFileName();
+        PduPart part     = new PduPart();
+
+        if (fileName == null) {
+          fileName      = String.valueOf(Math.abs(Util.getSecureRandom().nextLong()));
+          String fileExtension = MimeTypeMap.getSingleton().getExtensionFromMimeType(attachment.getContentType());
+
+          if (fileExtension != null) fileName = fileName + "." + fileExtension;
+        }
+
+        if (attachment.getContentType().startsWith("text")) {
+          part.setCharset(CharacterSets.UTF_8);
+        }
+
+        part.setContentType(attachment.getContentType().getBytes());
+        part.setContentLocation(fileName.getBytes());
+        part.setName(fileName.getBytes());
+
+        int index = fileName.lastIndexOf(".");
+        String contentId = (index == -1) ? fileName : fileName.substring(0, index);
+        part.setContentId(contentId.getBytes());
+        part.setData(Util.readFully(PartAuthority.getAttachmentStream(context, attachment.getDataUri())));
+
+        body.addPart(part);
+        size += getPartSize(part);
+      } catch (IOException e) {
+        Log.w(TAG, e);
+      }
+    }
+
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    SmilXmlSerializer.serialize(SmilHelper.createSmilDocument(body), out);
+    PduPart smilPart = new PduPart();
+    smilPart.setContentId("smil".getBytes());
+    smilPart.setContentLocation("smil.xml".getBytes());
+    smilPart.setContentType(ContentType.APP_SMIL.getBytes());
+    smilPart.setData(out.toByteArray());
+    body.addPart(0, smilPart);
+
+    req.setBody(body);
+    req.setMessageSize(size);
+    req.setMessageClass(PduHeaders.MESSAGE_CLASS_PERSONAL_STR.getBytes());
+    req.setExpiry(7 * 24 * 60 * 60);
+
+    try {
+      req.setPriority(PduHeaders.PRIORITY_NORMAL);
+      req.setDeliveryReport(PduHeaders.VALUE_NO);
+      req.setReadReport(PduHeaders.VALUE_NO);
+    } catch (InvalidHeaderValueException e) {}
+
+    return req;
+  }
+
+  private long getPartSize(PduPart part) {
+    return part.getName().length + part.getContentLocation().length +
+        part.getContentType().length + part.getData().length +
+        part.getContentId().length;
   }
 
   private void notifyMediaMessageDeliveryFailed(Context context, long messageId) {
-    long       threadId   = DatabaseFactory.getMmsDatabase(context).getThreadIdForMessage(messageId);
-    Recipients recipients = DatabaseFactory.getThreadDatabase(context).getRecipientsForThreadId(threadId);
+    long      threadId  = DatabaseFactory.getMmsDatabase(context).getThreadIdForMessage(messageId);
+    Recipient recipient = DatabaseFactory.getThreadDatabase(context).getRecipientForThreadId(threadId);
 
-    if (recipients != null) {
-      MessageNotifier.notifyMessageDeliveryFailed(context, recipients, threadId);
+    if (recipient != null) {
+      MessageNotifier.notifyMessageDeliveryFailed(context, recipient, threadId);
+    }
+  }
+
+  private String getMyNumber(Context context) throws UndeliverableMessageException {
+    try {
+      return Utils.getMyPhoneNumber(context);
+    } catch (SecurityException e) {
+      throw new UndeliverableMessageException(e);
+    }
+  }
+
+  public static class Factory implements Job.Factory<MmsSendJob> {
+    @Override
+    public @NonNull MmsSendJob create(@NonNull Parameters parameters, @NonNull Data data) {
+      return new MmsSendJob(parameters, data.getLong(KEY_MESSAGE_ID));
     }
   }
 }

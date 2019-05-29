@@ -6,9 +6,10 @@ import android.content.ContentProviderClient;
 import android.content.Context;
 import android.content.SyncResult;
 import android.os.Bundle;
-import android.util.Log;
+import org.thoughtcrime.securesms.logging.Log;
 
 import org.thoughtcrime.securesms.util.DirectoryHelper;
+import org.thoughtcrime.securesms.util.TextSecurePreferences;
 
 import java.io.IOException;
 
@@ -24,11 +25,25 @@ public class ContactsSyncAdapter extends AbstractThreadedSyncAdapter {
   public void onPerformSync(Account account, Bundle extras, String authority,
                             ContentProviderClient provider, SyncResult syncResult)
   {
-    try {
-      DirectoryHelper.refreshDirectory(getContext());
-    } catch (IOException e) {
-      Log.w(TAG, e);
+    Log.i(TAG, "onPerformSync(" + authority +")");
+
+    if (TextSecurePreferences.isPushRegistered(getContext())) {
+      try {
+        DirectoryHelper.refreshDirectory(getContext(), true);
+      } catch (IOException e) {
+        Log.w(TAG, e);
+      }
     }
+  }
+
+  @Override
+  public void onSyncCanceled() {
+    Log.w(TAG, "onSyncCanceled()");
+  }
+
+  @Override
+  public void onSyncCanceled(Thread thread) {
+    Log.w(TAG, "onSyncCanceled(" + thread + ")");
   }
 
 }

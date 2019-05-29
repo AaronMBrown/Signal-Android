@@ -1,18 +1,24 @@
 package org.thoughtcrime.securesms;
 
-import android.app.ActivityOptions;
+import android.annotation.TargetApi;
+import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
+import android.os.Build.VERSION_CODES;
 import android.os.Bundle;
 import android.support.annotation.NonNull;
 import android.support.v4.app.ActivityCompat;
 import android.support.v4.app.ActivityOptionsCompat;
 import android.support.v7.app.AppCompatActivity;
-import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
-import android.view.animation.AnimationUtils;
+import android.view.WindowManager;
+
+import org.thoughtcrime.securesms.logging.Log;
+import org.thoughtcrime.securesms.util.TextSecurePreferences;
+import org.thoughtcrime.securesms.util.dynamiclanguage.DynamicLanguageActivityHelper;
+import org.thoughtcrime.securesms.util.dynamiclanguage.DynamicLanguageContextWrapper;
 
 import java.lang.reflect.Field;
 
@@ -29,6 +35,13 @@ public abstract class BaseActionBarActivity extends AppCompatActivity {
   }
 
   @Override
+  protected void onResume() {
+    super.onResume();
+    initializeScreenshotSecurity();
+    DynamicLanguageActivityHelper.recreateIfNotInCorrectLanguage(this, TextSecurePreferences.getLanguage(this));
+  }
+
+  @Override
   public boolean onKeyDown(int keyCode, KeyEvent event) {
     return (keyCode == KeyEvent.KEYCODE_MENU && BaseActivity.isMenuWorkaroundRequired()) || super.onKeyDown(keyCode, event);
   }
@@ -40,6 +53,14 @@ public abstract class BaseActionBarActivity extends AppCompatActivity {
       return true;
     }
     return super.onKeyUp(keyCode, event);
+  }
+
+  private void initializeScreenshotSecurity() {
+    if (TextSecurePreferences.isScreenSecurityEnabled(this)) {
+      getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+    } else {
+      getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
+    }
   }
 
   /**
@@ -64,5 +85,17 @@ public abstract class BaseActionBarActivity extends AppCompatActivity {
     Bundle bundle = ActivityOptionsCompat.makeSceneTransitionAnimation(this, sharedView, transitionName)
                                          .toBundle();
     ActivityCompat.startActivity(this, intent, bundle);
+  }
+
+  @TargetApi(VERSION_CODES.LOLLIPOP)
+  protected void setStatusBarColor(int color) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+      getWindow().setStatusBarColor(color);
+    }
+  }
+
+  @Override
+  protected void attachBaseContext(Context newBase) {
+    super.attachBaseContext(DynamicLanguageContextWrapper.updateContext(newBase, TextSecurePreferences.getLanguage(newBase)));
   }
 }

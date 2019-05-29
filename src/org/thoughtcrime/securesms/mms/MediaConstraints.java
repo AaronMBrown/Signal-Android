@@ -1,75 +1,83 @@
 package org.thoughtcrime.securesms.mms;
 
 import android.content.Context;
-import android.graphics.Bitmap.CompressFormat;
 import android.net.Uri;
-import android.util.Log;
+import android.support.annotation.NonNull;
+import android.support.annotation.Nullable;
+import org.thoughtcrime.securesms.logging.Log;
 import android.util.Pair;
 
-import com.bumptech.glide.Glide;
-
-import org.thoughtcrime.securesms.crypto.MasterSecret;
+import org.thoughtcrime.securesms.attachments.Attachment;
 import org.thoughtcrime.securesms.mms.DecryptableStreamUriLoader.DecryptableUri;
 import org.thoughtcrime.securesms.util.BitmapDecodingException;
 import org.thoughtcrime.securesms.util.BitmapUtil;
 import org.thoughtcrime.securesms.util.MediaUtil;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.concurrent.ExecutionException;
-
-import ws.com.google.android.mms.pdu.PduPart;
 
 public abstract class MediaConstraints {
   private static final String TAG = MediaConstraints.class.getSimpleName();
 
-  public static MediaConstraints MMS_CONSTRAINTS  = new MmsMediaConstraints();
-  public static MediaConstraints PUSH_CONSTRAINTS = new PushMediaConstraints();
+  public static MediaConstraints getPushMediaConstraints() {
+    return new PushMediaConstraints();
+  }
+
+  public static MediaConstraints getMmsMediaConstraints(int subscriptionId) {
+    return new MmsMediaConstraints(subscriptionId);
+  }
 
   public abstract int getImageMaxWidth(Context context);
   public abstract int getImageMaxHeight(Context context);
-  public abstract int getImageMaxSize();
+  public abstract int getImageMaxSize(Context context);
 
-  public abstract int getGifMaxSize();
+  public abstract int getGifMaxSize(Context context);
+  public abstract int getVideoMaxSize(Context context);
+  public abstract int getAudioMaxSize(Context context);
+  public abstract int getDocumentMaxSize(Context context);
 
-  public abstract int getVideoMaxSize();
-
-  public abstract int getAudioMaxSize();
-
-  public boolean isSatisfied(Context context, MasterSecret masterSecret, PduPart part) {
+  public boolean isSatisfied(@NonNull Context context, @NonNull Attachment attachment) {
     try {
-      return (MediaUtil.isGif(part)    && part.getDataSize() <= getGifMaxSize()   && isWithinBounds(context, masterSecret, part.getDataUri())) ||
-             (MediaUtil.isImage(part)  && part.getDataSize() <= getImageMaxSize() && isWithinBounds(context, masterSecret, part.getDataUri())) ||
-             (MediaUtil.isAudio(part)  && part.getDataSize() <= getAudioMaxSize()) ||
-             (MediaUtil.isVideo(part)  && part.getDataSize() <= getVideoMaxSize()) ||
-             (!MediaUtil.isImage(part) && !MediaUtil.isAudio(part) && !MediaUtil.isVideo(part));
+      return (MediaUtil.isGif(attachment)    && attachment.getSize() <= getGifMaxSize(context)   && isWithinBounds(context, attachment.getDataUri())) ||
+             (MediaUtil.isImage(attachment)  && attachment.getSize() <= getImageMaxSize(context) && isWithinBounds(context, attachment.getDataUri())) ||
+             (MediaUtil.isAudio(attachment)  && attachment.getSize() <= getAudioMaxSize(context)) ||
+             (MediaUtil.isVideo(attachment)  && attachment.getSize() <= getVideoMaxSize(context)) ||
+             (MediaUtil.isFile(attachment) && attachment.getSize() <= getDocumentMaxSize(context));
     } catch (IOException ioe) {
       Log.w(TAG, "Failed to determine if media's constraints are satisfied.", ioe);
       return false;
     }
   }
 
-  public boolean isWithinBounds(Context context, MasterSecret masterSecret, Uri uri) throws IOException {
-    InputStream is = PartAuthority.getPartStream(context, masterSecret, uri);
-    Pair<Integer, Integer> dimensions = BitmapUtil.getDimensions(is);
-    return dimensions.first  > 0 && dimensions.first  <= getImageMaxWidth(context) &&
-           dimensions.second > 0 && dimensions.second <= getImageMaxHeight(context);
+  private boolean isWithinBounds(Context context, Uri uri) throws IOException {
+    try {
+      InputStream is = PartAuthority.getAttachmentStream(context, uri);
+      Pair<Integer, Integer> dimensions = BitmapUtil.getDimensions(is);
+      return dimensions.first  > 0 && dimensions.first  <= getImageMaxWidth(context) &&
+             dimensions.second > 0 && dimensions.second <= getImageMaxHeight(context);
+    } catch (BitmapDecodingException e) {
+      throw new IOException(e);
+    }
   }
 
-  public boolean canResize(PduPart part) {
-    return part != null && MediaUtil.isImage(part) && !MediaUtil.isGif(part);
+  public boolean canResize(@Nullable Attachment attachment) {
+    return attachment != null && MediaUtil.isImage(attachment) && !MediaUtil.isGif(attachment);
   }
 
-  public byte[] getResizedMedia(Context context, MasterSecret masterSecret, PduPart part)
+  public MediaStream getResizedMedia(@NonNull Context context, @NonNull Attachment attachment)
       throws IOException
   {
-    if (!canResize(part) || part.getDataUri() == null) {
+    if (!canResize(attachment)) {
       throw new UnsupportedOperationException("Cannot resize this content type");
     }
+
     try {
-      return BitmapUtil.createScaledBytes(context, new DecryptableUri(masterSecret, part.getDataUri()), this);
-    } catch (ExecutionException ee) {
-      throw new IOException(ee);
+      // XXX - This is loading everything into memory! We want the send path to be stream-like.
+      BitmapUtil.ScaleResult scaleResult = BitmapUtil.createScaledBytes(context, new DecryptableUri(attachment.getDataUri()), this);
+      return new MediaStream(new ByteArrayInputStream(scaleResult.getBitmap()), MediaUtil.IMAGE_JPEG, scaleResult.getWidth(), scaleResult.getHeight());
+    } catch (BitmapDecodingException e) {
+      throw new IOException(e);
     }
   }
 }

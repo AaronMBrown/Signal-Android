@@ -1,39 +1,60 @@
 package org.thoughtcrime.securesms.jobs;
 
-import android.content.Context;
-import android.util.Log;
+import org.thoughtcrime.securesms.jobmanager.Data;
+import org.thoughtcrime.securesms.jobmanager.Job;
+import org.thoughtcrime.securesms.logging.Log;
+
+import android.support.annotation.NonNull;
 import android.util.Pair;
 
+import com.google.android.mms.pdu_alt.GenericPdu;
+import com.google.android.mms.pdu_alt.NotificationInd;
+import com.google.android.mms.pdu_alt.PduHeaders;
+import com.google.android.mms.pdu_alt.PduParser;
+
 import org.thoughtcrime.securesms.ApplicationContext;
+import org.thoughtcrime.securesms.database.Address;
 import org.thoughtcrime.securesms.database.DatabaseFactory;
 import org.thoughtcrime.securesms.database.MmsDatabase;
-import org.thoughtcrime.securesms.recipients.RecipientFactory;
-import org.thoughtcrime.securesms.recipients.Recipients;
+import org.thoughtcrime.securesms.recipients.Recipient;
+import org.thoughtcrime.securesms.util.Base64;
 import org.thoughtcrime.securesms.util.Util;
-import org.whispersystems.jobqueue.JobParameters;
 
-import ws.com.google.android.mms.pdu.GenericPdu;
-import ws.com.google.android.mms.pdu.NotificationInd;
-import ws.com.google.android.mms.pdu.PduHeaders;
-import ws.com.google.android.mms.pdu.PduParser;
+import java.io.IOException;
 
-public class MmsReceiveJob extends ContextJob {
+public class MmsReceiveJob extends BaseJob {
+
+  public static final String KEY = "MmsReceiveJob";
 
   private static final String TAG = MmsReceiveJob.class.getSimpleName();
 
-  private final byte[] data;
+  private static final String KEY_DATA            = "data";
+  private static final String KEY_SUBSCRIPTION_ID = "subscription_id";
 
-  public MmsReceiveJob(Context context, byte[] data) {
-    super(context, JobParameters.newBuilder()
-                                .withWakeLock(true)
-                                .withPersistence().create());
+  private byte[] data;
+  private int    subscriptionId;
 
-    this.data = data;
+  public MmsReceiveJob(byte[] data, int subscriptionId) {
+    this(new Job.Parameters.Builder().setMaxAttempts(25).build(), data, subscriptionId);
+  }
+
+  private MmsReceiveJob(@NonNull Job.Parameters parameters, byte[] data, int subscriptionId) {
+    super(parameters);
+
+    this.data           = data;
+    this.subscriptionId = subscriptionId;
   }
 
   @Override
-  public void onAdded() {
+  public @NonNull Data serialize() {
+    return new Data.Builder().putString(KEY_DATA, Base64.encodeBytes(data))
+                             .putInt(KEY_SUBSCRIPTION_ID, subscriptionId)
+                             .build();
+  }
 
+  @Override
+  public @NonNull String getFactoryKey() {
+    return KEY;
   }
 
   @Override
@@ -54,14 +75,13 @@ public class MmsReceiveJob extends ContextJob {
 
     if (isNotification(pdu) && !isBlocked(pdu)) {
       MmsDatabase database                = DatabaseFactory.getMmsDatabase(context);
-      Pair<Long, Long> messageAndThreadId = database.insertMessageInbox((NotificationInd)pdu);
+      Pair<Long, Long> messageAndThreadId = database.insertMessageInbox((NotificationInd)pdu, subscriptionId);
 
-      Log.w(TAG, "Inserted received MMS notification...");
+      Log.i(TAG, "Inserted received MMS notification...");
 
       ApplicationContext.getInstance(context)
                         .getJobManager()
-                        .add(new MmsDownloadJob(context,
-                                                messageAndThreadId.first,
+                        .add(new MmsDownloadJob(messageAndThreadId.first,
                                                 messageAndThreadId.second,
                                                 true));
     } else if (isNotification(pdu)) {
@@ -81,7 +101,7 @@ public class MmsReceiveJob extends ContextJob {
 
   private boolean isBlocked(GenericPdu pdu) {
     if (pdu.getFrom() != null && pdu.getFrom().getTextString() != null) {
-      Recipients recipients = RecipientFactory.getRecipientsFromString(context, Util.toIsoString(pdu.getFrom().getTextString()), false);
+      Recipient recipients = Recipient.from(context, Address.fromExternal(context, Util.toIsoString(pdu.getFrom().getTextString())), false);
       return recipients.isBlocked();
     }
 
@@ -90,5 +110,16 @@ public class MmsReceiveJob extends ContextJob {
 
   private boolean isNotification(GenericPdu pdu) {
     return pdu != null && pdu.getMessageType() == PduHeaders.MESSAGE_TYPE_NOTIFICATION_IND;
+  }
+
+  public static final class Factory implements Job.Factory<MmsReceiveJob> {
+    @Override
+    public @NonNull MmsReceiveJob create(@NonNull Parameters parameters, @NonNull Data data) {
+      try {
+        return new MmsReceiveJob(parameters, Base64.decode(data.getString(KEY_DATA)), data.getInt(KEY_SUBSCRIPTION_ID));
+      } catch (IOException e) {
+        throw new AssertionError(e);
+      }
+    }
   }
 }

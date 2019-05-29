@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (C) 2011 Whisper Systems
  *
  * This program is free software: you can redistribute it and/or modify
@@ -18,18 +18,6 @@ package org.thoughtcrime.securesms;
 
 import android.content.Intent;
 import android.os.Bundle;
-import android.support.annotation.NonNull;
-import android.view.Menu;
-import android.view.MenuInflater;
-import android.view.MenuItem;
-import android.view.View;
-
-import org.thoughtcrime.securesms.crypto.MasterSecret;
-import org.thoughtcrime.securesms.util.DirectoryHelper;
-import org.thoughtcrime.securesms.util.DynamicLanguage;
-import org.thoughtcrime.securesms.util.DynamicNoActionBarTheme;
-import org.thoughtcrime.securesms.util.DynamicTheme;
-import org.thoughtcrime.securesms.util.TextSecurePreferences;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -42,27 +30,25 @@ import java.util.List;
  */
 public class PushContactSelectionActivity extends ContactSelectionActivity {
 
+  @SuppressWarnings("unused")
   private final static String TAG = PushContactSelectionActivity.class.getSimpleName();
 
   @Override
-  protected void onCreate(Bundle icicle, @NonNull MasterSecret masterSecret) {
-    super.onCreate(icicle, masterSecret);
-    contactsFragment.setMultiSelect(true);
+  protected void onCreate(Bundle icicle, boolean ready) {
+    getIntent().putExtra(ContactSelectionListFragment.MULTI_SELECT, true);
+    super.onCreate(icicle, ready);
 
-    action.setImageDrawable(getResources().getDrawable(R.drawable.ic_check_white_24dp));
-    action.setOnClickListener(new View.OnClickListener() {
-      @Override
-      public void onClick(View v) {
-        Intent       resultIntent     = getIntent();
-        List<String> selectedContacts = contactsFragment.getSelectedContacts();
+    getToolbar().setNavigationIcon(R.drawable.ic_check_white_24dp);
+    getToolbar().setNavigationOnClickListener(v -> {
+      Intent resultIntent = getIntent();
+      List<String> selectedContacts = contactsFragment.getSelectedContacts();
 
-        if (selectedContacts != null) {
-          resultIntent.putStringArrayListExtra("contacts", new ArrayList<>(selectedContacts));
-        }
-
-        setResult(RESULT_OK, resultIntent);
-        finish();
+      if (selectedContacts != null) {
+        resultIntent.putStringArrayListExtra("contacts", new ArrayList<>(selectedContacts));
       }
+
+      setResult(RESULT_OK, resultIntent);
+      finish();
     });
   }
 }

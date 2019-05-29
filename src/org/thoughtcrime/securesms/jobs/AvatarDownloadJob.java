@@ -1,69 +1,105 @@
 package org.thoughtcrime.securesms.jobs;
 
-import android.content.Context;
 import android.graphics.Bitmap;
-import android.util.Log;
+import android.support.annotation.NonNull;
 
-import org.thoughtcrime.securesms.BuildConfig;
-import org.thoughtcrime.securesms.crypto.MasterSecret;
 import org.thoughtcrime.securesms.database.DatabaseFactory;
 import org.thoughtcrime.securesms.database.GroupDatabase;
-import org.thoughtcrime.securesms.jobs.requirements.MasterSecretRequirement;
+import org.thoughtcrime.securesms.database.GroupDatabase.GroupRecord;
+import org.thoughtcrime.securesms.dependencies.InjectableType;
+import org.thoughtcrime.securesms.jobmanager.Data;
+import org.thoughtcrime.securesms.jobmanager.Job;
+import org.thoughtcrime.securesms.jobmanager.impl.NetworkConstraint;
+import org.thoughtcrime.securesms.logging.Log;
 import org.thoughtcrime.securesms.mms.AttachmentStreamUriLoader.AttachmentModel;
-import org.thoughtcrime.securesms.push.TextSecurePushTrustStore;
+import org.thoughtcrime.securesms.util.BitmapDecodingException;
 import org.thoughtcrime.securesms.util.BitmapUtil;
-import org.thoughtcrime.securesms.util.TextSecurePreferences;
-import org.whispersystems.jobqueue.JobParameters;
-import org.whispersystems.jobqueue.requirements.NetworkRequirement;
-import org.whispersystems.textsecure.api.push.exceptions.NonSuccessfulResponseCodeException;
-import org.whispersystems.textsecure.internal.push.PushServiceSocket;
-import org.whispersystems.textsecure.internal.util.StaticCredentialsProvider;
+import org.thoughtcrime.securesms.util.GroupUtil;
+import org.thoughtcrime.securesms.util.Hex;
+import org.whispersystems.libsignal.InvalidMessageException;
+import org.whispersystems.libsignal.util.guava.Optional;
+import org.whispersystems.signalservice.api.SignalServiceMessageReceiver;
+import org.whispersystems.signalservice.api.messages.SignalServiceAttachmentPointer;
+import org.whispersystems.signalservice.api.push.exceptions.NonSuccessfulResponseCodeException;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.concurrent.ExecutionException;
+import java.io.InputStream;
 
-public class AvatarDownloadJob extends MasterSecretJob {
+import javax.inject.Inject;
+
+public class AvatarDownloadJob extends BaseJob implements InjectableType {
+
+  public static final String KEY = "AvatarDownloadJob";
 
   private static final String TAG = AvatarDownloadJob.class.getSimpleName();
 
-  private final byte[] groupId;
+  private static final int MAX_AVATAR_SIZE = 20 * 1024 * 1024;
 
-  public AvatarDownloadJob(Context context, byte[] groupId) {
-    super(context, JobParameters.newBuilder()
-                                .withRequirement(new MasterSecretRequirement(context))
-                                .withRequirement(new NetworkRequirement(context))
-                                .withPersistence()
-                                .create());
+  private static final String KEY_GROUP_ID = "group_id";
 
+  @Inject SignalServiceMessageReceiver receiver;
+
+  private byte[] groupId;
+
+  public AvatarDownloadJob(@NonNull byte[] groupId) {
+    this(new Job.Parameters.Builder()
+                           .addConstraint(NetworkConstraint.KEY)
+                           .setMaxAttempts(10)
+                           .build(),
+         groupId);
+  }
+
+  private AvatarDownloadJob(@NonNull Job.Parameters parameters, @NonNull byte[] groupId) {
+    super(parameters);
     this.groupId = groupId;
   }
 
   @Override
-  public void onAdded() {}
+  public @NonNull Data serialize() {
+    return new Data.Builder().putString(KEY_GROUP_ID, GroupUtil.getEncodedId(groupId, false)).build();
+  }
 
   @Override
-  public void onRun(MasterSecret masterSecret) throws IOException {
-    GroupDatabase             database   = DatabaseFactory.getGroupDatabase(context);
-    GroupDatabase.GroupRecord record     = database.getGroup(groupId);
-    File                      attachment = null;
+  public @NonNull String getFactoryKey() {
+    return KEY;
+  }
+
+  @Override
+  public void onRun() throws IOException {
+    String                encodeId   = GroupUtil.getEncodedId(groupId, false);
+    GroupDatabase         database   = DatabaseFactory.getGroupDatabase(context);
+    Optional<GroupRecord> record     = database.getGroup(encodeId);
+    File                  attachment = null;
 
     try {
-      if (record != null) {
-        long   avatarId = record.getAvatarId();
-        byte[] key      = record.getAvatarKey();
-        String relay    = record.getRelay();
+      if (record.isPresent()) {
+        long             avatarId    = record.get().getAvatarId();
+        String           contentType = record.get().getAvatarContentType();
+        byte[]           key         = record.get().getAvatarKey();
+        String           relay       = record.get().getRelay();
+        Optional<byte[]> digest      = Optional.fromNullable(record.get().getAvatarDigest());
+        Optional<String> fileName    = Optional.absent();
 
         if (avatarId == -1 || key == null) {
           return;
         }
 
-        attachment = downloadAttachment(relay, avatarId);
-        Bitmap avatar = BitmapUtil.createScaledBitmap(context, new AttachmentModel(attachment, key), 500, 500);
+        if (digest.isPresent()) {
+          Log.i(TAG, "Downloading group avatar with digest: " + Hex.toString(digest.get()));
+        }
 
-        database.updateAvatar(groupId, avatar);
+        attachment = File.createTempFile("avatar", "tmp", context.getCacheDir());
+        attachment.deleteOnExit();
+
+        SignalServiceAttachmentPointer pointer     = new SignalServiceAttachmentPointer(avatarId, contentType, key, Optional.of(0), Optional.absent(), 0, 0, digest, fileName, false, Optional.absent());
+        InputStream                    inputStream = receiver.retrieveAttachment(pointer, attachment, MAX_AVATAR_SIZE);
+        Bitmap                         avatar      = BitmapUtil.createScaledBitmap(context, new AttachmentModel(attachment, key, 0, digest), 500, 500);
+
+        database.updateAvatar(encodeId, avatar);
+        inputStream.close();
       }
-    } catch (ExecutionException | NonSuccessfulResponseCodeException e) {
+    } catch (BitmapDecodingException | NonSuccessfulResponseCodeException | InvalidMessageException e) {
       Log.w(TAG, e);
     } finally {
       if (attachment != null)
@@ -75,26 +111,19 @@ public class AvatarDownloadJob extends MasterSecretJob {
   public void onCanceled() {}
 
   @Override
-  public boolean onShouldRetryThrowable(Exception exception) {
+  public boolean onShouldRetry(Exception exception) {
     if (exception instanceof IOException) return true;
     return false;
   }
 
-  private File downloadAttachment(String relay, long contentLocation) throws IOException {
-    PushServiceSocket socket = new PushServiceSocket(BuildConfig.TEXTSECURE_URL,
-                                                     new TextSecurePushTrustStore(context),
-                                                     new StaticCredentialsProvider(TextSecurePreferences.getLocalNumber(context),
-                                                                                   TextSecurePreferences.getPushServerPassword(context),
-                                                                                   null),
-                                                     BuildConfig.USER_AGENT);
-
-    File destination = File.createTempFile("avatar", "tmp");
-
-    destination.deleteOnExit();
-
-    socket.retrieveAttachment(relay, contentLocation, destination, null);
-
-    return destination;
+  public static final class Factory implements Job.Factory<AvatarDownloadJob> {
+    @Override
+    public @NonNull AvatarDownloadJob create(@NonNull Parameters parameters, @NonNull Data data) {
+      try {
+        return new AvatarDownloadJob(parameters, GroupUtil.getDecodedId(data.getString(KEY_GROUP_ID)));
+      } catch (IOException e) {
+        throw new AssertionError(e);
+      }
+    }
   }
-
 }

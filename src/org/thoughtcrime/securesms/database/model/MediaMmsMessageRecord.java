@@ -17,23 +17,21 @@
 package org.thoughtcrime.securesms.database.model;
 
 import android.content.Context;
+import android.support.annotation.NonNull;
+import android.support.annotation.Nullable;
 import android.text.SpannableString;
-import android.util.Log;
 
 import org.thoughtcrime.securesms.R;
+import org.thoughtcrime.securesms.contactshare.Contact;
 import org.thoughtcrime.securesms.database.MmsDatabase;
-import org.thoughtcrime.securesms.database.documents.NetworkFailure;
+import org.thoughtcrime.securesms.database.SmsDatabase.Status;
 import org.thoughtcrime.securesms.database.documents.IdentityKeyMismatch;
-import org.thoughtcrime.securesms.mms.MediaNotFoundException;
-import org.thoughtcrime.securesms.mms.Slide;
+import org.thoughtcrime.securesms.database.documents.NetworkFailure;
+import org.thoughtcrime.securesms.linkpreview.LinkPreview;
 import org.thoughtcrime.securesms.mms.SlideDeck;
 import org.thoughtcrime.securesms.recipients.Recipient;
-import org.thoughtcrime.securesms.recipients.Recipients;
-import org.thoughtcrime.securesms.util.FutureTaskListener;
-import org.thoughtcrime.securesms.util.ListenableFutureTask;
 
 import java.util.List;
-import java.util.concurrent.ExecutionException;
 
 /**
  * Represents the message record model for MMS messages that contain
@@ -43,80 +41,32 @@ import java.util.concurrent.ExecutionException;
  *
  */
 
-public class MediaMmsMessageRecord extends MessageRecord {
+public class MediaMmsMessageRecord extends MmsMessageRecord {
   private final static String TAG = MediaMmsMessageRecord.class.getSimpleName();
 
-  private final Context context;
-  private final int partCount;
-  private final ListenableFutureTask<SlideDeck> slideDeckFutureTask;
+  private final int     partCount;
 
-  public MediaMmsMessageRecord(Context context, long id, Recipients recipients,
+  public MediaMmsMessageRecord(long id, Recipient conversationRecipient,
                                Recipient individualRecipient, int recipientDeviceId,
-                               long dateSent, long dateReceived, int deliveredCount,
-                               long threadId, Body body,
-                               ListenableFutureTask<SlideDeck> slideDeck,
+                               long dateSent, long dateReceived, int deliveryReceiptCount,
+                               long threadId, String body,
+                               @NonNull SlideDeck slideDeck,
                                int partCount, long mailbox,
                                List<IdentityKeyMismatch> mismatches,
-                               List<NetworkFailure> failures)
+                               List<NetworkFailure> failures, int subscriptionId,
+                               long expiresIn, long expireStarted, int readReceiptCount,
+                               @Nullable Quote quote, @Nullable List<Contact> contacts,
+                               @Nullable List<LinkPreview> linkPreviews, boolean unidentified)
   {
-    super(context, id, body, recipients, individualRecipient, recipientDeviceId,
-          dateSent, dateReceived, threadId, DELIVERY_STATUS_NONE, deliveredCount, mailbox,
-          mismatches, failures);
-
-    this.context             = context.getApplicationContext();
-    this.partCount           = partCount;
-    this.slideDeckFutureTask = slideDeck;
-  }
-
-  public ListenableFutureTask<SlideDeck> getSlideDeckFuture() {
-    return slideDeckFutureTask;
-  }
-
-  private SlideDeck getSlideDeckSync() {
-    try {
-      return slideDeckFutureTask.get();
-    } catch (InterruptedException e) {
-      Log.w(TAG, e);
-      return null;
-    } catch (ExecutionException e) {
-      Log.w(TAG, e);
-      return null;
-    }
-  }
-
-  public boolean containsMediaSlide() {
-    SlideDeck deck = getSlideDeckSync();
-    return deck != null && deck.containsMediaSlide();
-  }
-
-
-  public void fetchMediaSlide(final FutureTaskListener<Slide> listener) {
-    slideDeckFutureTask.addListener(new FutureTaskListener<SlideDeck>() {
-      @Override
-      public void onSuccess(SlideDeck deck) {
-        for (Slide slide : deck.getSlides()) {
-          if (slide.hasImage() || slide.hasVideo() || slide.hasAudio()) {
-            listener.onSuccess(slide);
-            return;
-          }
-        }
-        listener.onFailure(new MediaNotFoundException("no media slide found"));
-      }
-
-      @Override
-      public void onFailure(Throwable error) {
-        listener.onFailure(error);
-      }
-    });
+    super(id, body, conversationRecipient, individualRecipient, recipientDeviceId, dateSent,
+          dateReceived, threadId, Status.STATUS_NONE, deliveryReceiptCount, mailbox, mismatches, failures,
+          subscriptionId, expiresIn, expireStarted, slideDeck, readReceiptCount, quote, contacts,
+          linkPreviews, unidentified);
+    this.partCount = partCount;
   }
 
   public int getPartCount() {
     return partCount;
-  }
-
-  @Override
-  public boolean isMms() {
-    return true;
   }
 
   @Override
@@ -125,10 +75,8 @@ public class MediaMmsMessageRecord extends MessageRecord {
   }
 
   @Override
-  public SpannableString getDisplayBody() {
-    if (MmsDatabase.Types.isDecryptInProgressType(type)) {
-      return emphasisAdded(context.getString(R.string.MmsMessageRecord_decrypting_mms_please_wait));
-    } else if (MmsDatabase.Types.isFailedDecryptType(type)) {
+  public SpannableString getDisplayBody(@NonNull Context context) {
+    if (MmsDatabase.Types.isFailedDecryptType(type)) {
       return emphasisAdded(context.getString(R.string.MmsMessageRecord_bad_encrypted_mms_message));
     } else if (MmsDatabase.Types.isDuplicateMessageType(type)) {
       return emphasisAdded(context.getString(R.string.SmsMessageRecord_duplicate_message));
@@ -136,10 +84,8 @@ public class MediaMmsMessageRecord extends MessageRecord {
       return emphasisAdded(context.getString(R.string.MmsMessageRecord_mms_message_encrypted_for_non_existing_session));
     } else if (isLegacyMessage()) {
       return emphasisAdded(context.getString(R.string.MessageRecord_message_encrypted_with_a_legacy_protocol_version_that_is_no_longer_supported));
-    } else if (!getBody().isPlaintext()) {
-      return emphasisAdded(context.getString(R.string.MessageNotifier_locked_message));
     }
 
-    return super.getDisplayBody();
+    return super.getDisplayBody(context);
   }
 }
